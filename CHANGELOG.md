@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.0] - 2026-08-18
+
+### Added
+
+- 支持将微信桥接绑定到 DSH 项目会话，微信消息直接复用所选项目会话，实现跨会话记忆 / 接着电脑端会话聊。
+- Web 管理面板新增「项目对话绑定」区域，可列出项目会话并绑定/解绑。
+- 微信端新增 `/sessionlist`、`/session <序号或ID>`、`/session off` 命令。
+- 新增模型工具 `wechat_bridge_list_projects` / `wechat_bridge_select_project`，可在微信里通过自然语言查看并进入项目。
+- 新增内部 API：`/api/projects`、`/api/projects/select`、`/api/projects/detach`。
+- 新增 `selected-sessions.json` 持久化项目绑定关系。
+
+### Fixed
+
+- 确认并记录 Web 管理面板标签点击无反应问题已修复（React 组件两参注册）。
+
 ## [0.1.1] - 2026-08-18
 
 ### Fixed
