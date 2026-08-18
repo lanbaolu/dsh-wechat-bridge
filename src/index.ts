@@ -122,6 +122,8 @@ export function apply(ctx: Context, config: Config): void {
   const activeSessionIds = new Set<string>()
   const creating = new Map<string, Promise<AgentHandle>>()
   const streamClients = new Map<string, Set<ServerResponse>>()
+  /** Accounts waiting to switch to a selected project after the current turn ends. */
+  const pendingProjectSwitches = new Set<string>()
   let bridgeChild: ChildProcess | undefined
   let bridgeStartedAt: number | undefined
   let internalServer: ReturnType<typeof createServer> | undefined
@@ -208,6 +210,15 @@ export function apply(ctx: Context, config: Config): void {
   // -------------------------------------------------------------------------
 
   async function ensureAgent(accountId: string, input?: { cwd?: string; model?: string }): Promise<AgentHandle> {
+    // If the model just selected a project from inside a WeChat turn, finish
+    // tearing down the old bridge agent before accepting the next message.
+    if (pendingProjectSwitches.has(accountId)) {
+      pendingProjectSwitches.delete(accountId)
+      if (agents.has(accountId)) {
+        await disposeAgent(accountId, { preserveSelection: true })
+      }
+    }
+
     const existing = agents.get(accountId)
     if (existing) return existing
 
@@ -324,14 +335,14 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  async function disposeAgent(accountId: string): Promise<void> {
+  async function disposeAgent(accountId: string, options?: { preserveSelection?: boolean }): Promise<void> {
     const handle = agents.get(accountId)
     const dshSessionId = sessionIds.get(accountId)
     if (dshSessionId) activeSessionIds.delete(dshSessionId)
     sessionIds.delete(accountId)
     agents.delete(accountId)
     removePersistedSessionId(accountId)
-    if (selectedSessionIds.has(accountId)) {
+    if (!options?.preserveSelection && selectedSessionIds.has(accountId)) {
       selectedSessionIds.delete(accountId)
       removeSelectedSessionId(accountId)
     }
@@ -462,6 +473,56 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  function accountIdForAgent(agent: { session?: { id?: unknown } } | undefined): string | undefined {
+    if (!agent?.session?.id) return undefined
+    const sid = String(agent.session.id)
+    for (const [accountId, dshSessionId] of sessionIds) {
+      if (dshSessionId === sid) return accountId
+    }
+    return undefined
+  }
+
+  async function selectProjectFromAgent(agent: { session?: { id?: unknown } } | undefined, sessionId: string): Promise<Record<string, unknown>> {
+    const accountId = accountIdForAgent(agent)
+    if (!accountId) {
+      return { ok: false, error: '当前不是微信桥接会话，无法切换项目。' }
+    }
+    const items = await listProjectSessions()
+    const item = items.find((candidate) => candidate.sessionId === sessionId)
+    if (!item) {
+      return { ok: false, error: '未找到该项目会话，请先使用 wechat_bridge_list_projects 查看可绑定项目。' }
+    }
+
+    const currentDshSessionId = sessionIds.get(accountId)
+    if (sessionId === currentDshSessionId) {
+      return {
+        ok: true,
+        accountId,
+        selectedSessionId: sessionId,
+        project: item,
+        message: `已经在项目 ${item.workspaceTitle} 中。`,
+      }
+    }
+
+    const sessionsService = ctx.get('sessions') as { get(id: unknown): unknown } | undefined
+    if (sessionsService?.get(SessionId(sessionId))) {
+      return { ok: false, error: '该项目会话当前正在 DSH 中打开，请先在 DSH 中关闭该会话后再进入。' }
+    }
+
+    selectedSessionIds.set(accountId, sessionId)
+    persistSelectedSessionId(accountId, sessionId)
+    resetBridgeAccountSession(accountId, item.path)
+    pendingProjectSwitches.add(accountId)
+
+    return {
+      ok: true,
+      accountId,
+      selectedSessionId: sessionId,
+      project: item,
+      message: `已进入项目 ${item.workspaceTitle}（${item.path}），后续对话会记录到这个项目。`,
+    }
+  }
+
   function readBridgeAccountSession(accountId: string): Record<string, unknown> {
     validateAccountId(accountId)
     return loadJson<Record<string, unknown>>(join(dataDir, 'sessions', `${accountId}.json`), {})
@@ -587,6 +648,15 @@ export function apply(ctx: Context, config: Config): void {
     } else if (event.type === 'turn/end') {
       debugLog('session turn/end', { accountId, sessionId: sid, reason: event.data.reason })
       broadcast(accountId, { type: 'done', turn: event.data.turn, message: 'turn ended' })
+      if (pendingProjectSwitches.has(accountId)) {
+        pendingProjectSwitches.delete(accountId)
+        void disposeAgent(accountId, { preserveSelection: true }).catch((err) => {
+          debugLog('pending project switch dispose failed', {
+            accountId,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        })
+      }
     }
   })
 
@@ -1122,6 +1192,74 @@ export function apply(ctx: Context, config: Config): void {
         return {
           ok: true,
           message: `运行中: ${p.running}\nPID: ${p.pid ?? '无'}\n数据目录: ${p.dataDir}\n账号: ${(p.accounts as string[]).join(', ') || '无'}\n活跃会话: ${(p.sessions as string[]).join(', ') || '无'}`,
+        }
+      },
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'wechat_bridge_list_projects',
+      description: '列出 DSH 中可绑定的项目会话（含项目名、路径、会话 ID）。微信桥接会话中可用自然语言让模型调用此工具查看可进入的项目。',
+      parameters: {},
+      output: {
+        schema: {
+          type: 'object' as const,
+          additionalProperties: false,
+          properties: {
+            ok: { type: 'boolean' as const, required: true as const },
+            message: { type: 'string' as const, required: true as const },
+            projects: {
+              type: 'array' as const,
+              required: true as const,
+              items: {
+                type: 'object' as const,
+                additionalProperties: false,
+                properties: {
+                  sessionId: { type: 'string' as const, required: true as const },
+                  workspaceTitle: { type: 'string' as const, required: true as const },
+                  path: { type: 'string' as const, required: true as const },
+                  live: { type: 'boolean' as const, required: true as const },
+                },
+              },
+            },
+          },
+        },
+        render: (_args: unknown, value: { projects: Array<{ sessionId: string; workspaceTitle: string; path: string; live: boolean }> }) => [{
+          type: 'text' as const,
+          text: value.projects.length === 0
+            ? '当前没有可绑定的项目会话。'
+            : `📁 可进入的项目会话（${value.projects.length} 个）：\n` + value.projects.map((p, i) => `${i + 1}. ${p.workspaceTitle} · ${p.path} · ${p.sessionId.slice(-8)}`).join('\n'),
+        }],
+      },
+      execute: async () => {
+        const items = await listProjectSessions()
+        return {
+          ok: true,
+          message: `共 ${items.length} 个项目会话`,
+          projects: items.map((item) => ({
+            sessionId: item.sessionId,
+            workspaceTitle: item.workspaceTitle,
+            path: item.path,
+            live: item.live,
+          })),
+        }
+      },
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'wechat_bridge_select_project',
+      description: '进入一个 DSH 项目会话。微信桥接会话中，模型应先调用 wechat_bridge_list_projects 获取 sessionId，再调用本工具切换到对应项目；切换后后续微信对话会记录到该项目。',
+      parameters: {
+        sessionId: { type: 'string', description: '要进入的项目会话 ID，来自 wechat_bridge_list_projects 返回的 sessionId。' },
+      },
+      output: simpleOutput,
+      execute: async (args: { sessionId: string }, exec: { agent?: { session?: { id?: unknown } } }) => {
+        const result = await selectProjectFromAgent(exec?.agent, args.sessionId)
+        if (!result.ok) {
+          throw new Error(String(result.error || '进入项目失败'))
+        }
+        return {
+          ok: true,
+          message: String(result.message || '已进入项目。'),
         }
       },
     }))

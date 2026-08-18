@@ -14,7 +14,7 @@
 | 超时安抚 | ✅ | 5 分钟无输出时自动发送安抚消息 |
 | 消息队列基础版 | ✅ | 串行处理 + 处理中消息重新排队，不再丢弃 |
 | 跨重启续聊 | ✅ | 持久化 `accountId → dshSessionId` 映射，启动优先 `ctx.agents.resume`；失败再新建 |
-| 选择项目对话（Web 面板 + 微信命令） | ✅ | Web 面板可直接绑定；微信端支持 `/sessionlist`、`/session <序号或ID>`、`/session off` 绑定/解绑 |
+| 选择项目对话（Web 面板 + 微信命令 + 自然语言） | ✅ | Web 面板可直接绑定；微信端支持 `/sessionlist`、`/session <序号或ID>`；模型可通过 `wechat_bridge_list_projects` / `wechat_bridge_select_project` 自然语言进入项目 |
 
 ## 未完成 / 待评估
 
@@ -41,7 +41,7 @@
 
 ### 3. 接续电脑会话 / 跨重启续聊
 
-**现状**：已实现。桥接数据目录持久化 `accountId -> dshSessionId` 映射；DSH Host 重启后优先 `ctx.agents.resume` 恢复原会话，只有映射缺失、旧日志损坏或工作目录变化时才新建会话。Web 面板已支持选择项目会话并绑定；微信端也已支持 `/sessionlist`、`/session <序号或ID>`、`/session off` 绑定/解绑。
+**现状**：已实现。桥接数据目录持久化 `accountId -> dshSessionId` 映射；DSH Host 重启后优先 `ctx.agents.resume` 恢复原会话，只有映射缺失、旧日志损坏或工作目录变化时才新建会话。Web 面板已支持选择项目会话并绑定；微信端支持 `/sessionlist`、`/session <序号或ID>`；DSH 模型也可在微信对话中通过 `wechat_bridge_list_projects` / `wechat_bridge_select_project` 自然语言进入项目。
 
 **后续可选**：
 - 桥接守护进程改为独立 DSH SDK runtime（`@deepseek-ai/dsh-sdk-client`），完全脱离 Web GUI 进程，天然可跨重启恢复。
