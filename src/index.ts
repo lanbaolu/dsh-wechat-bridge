@@ -12,7 +12,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, statSync, unlinkSync, chmodSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
@@ -29,6 +29,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-workspace'
+import { startQrLogin, checkQrStatus } from './bridge/wechat/login.js'
 
 export const name = '@dsh-external/dsh-wechat-bridge'
 
@@ -114,6 +115,7 @@ export function apply(ctx: Context, config: Config): void {
   let bridgeStartedAt: number | undefined
   let internalServer: ReturnType<typeof createServer> | undefined
   let internalPort = 0
+  let pendingSetup: { qrcodeId: string; workingDirectory: string } | undefined
 
   // -------------------------------------------------------------------------
   // DSH session id persistence (cross-restart continuation)
@@ -561,6 +563,92 @@ export function apply(ctx: Context, config: Config): void {
     return startDaemon()
   }
 
+  function bridgeConfigPath(): string {
+    return join(dataDir, 'config.json')
+  }
+
+  function readBridgeConfig(): { workingDirectory: string; model?: string; systemPrompt?: string } {
+    try {
+      const raw = JSON.parse(readFileSync(bridgeConfigPath(), 'utf8')) as {
+        workingDirectory?: string
+        model?: string
+        systemPrompt?: string
+      }
+      return {
+        workingDirectory: raw.workingDirectory || join(homedir(), 'Documents', 'DSH'),
+        model: raw.model,
+        systemPrompt: raw.systemPrompt,
+      }
+    } catch {
+      return {
+        workingDirectory: join(homedir(), 'Documents', 'DSH'),
+      }
+    }
+  }
+
+  function saveBridgeConfig(config: { workingDirectory: string; model?: string; systemPrompt?: string }): void {
+    mkdirSync(dataDir, { recursive: true })
+    const data: Record<string, string> = {
+      workingDirectory: config.workingDirectory,
+    }
+    if (config.model) data.model = config.model
+    if (config.systemPrompt) data.systemPrompt = config.systemPrompt
+    writeFileSync(bridgeConfigPath(), JSON.stringify(data, null, 2) + '\n', 'utf8')
+    if (process.platform !== 'win32') {
+      chmodSync(bridgeConfigPath(), 0o600)
+    }
+  }
+
+  async function startSetup(workingDirectory?: string): Promise<Record<string, unknown>> {
+    const dir = (workingDirectory?.trim() || readBridgeConfig().workingDirectory || join(homedir(), 'Documents', 'DSH')).replace(/^~/, homedir())
+    const { qrcodeUrl, qrcodeId } = await startQrLogin()
+    const QRCode = await import('qrcode')
+    const qrcodeDataUrl = await QRCode.toDataURL(qrcodeUrl, {
+      width: 320,
+      margin: 2,
+    })
+    pendingSetup = { qrcodeId, workingDirectory: dir }
+    return {
+      ok: true,
+      qrcodeId,
+      qrcodeUrl,
+      qrcodeDataUrl,
+      workingDirectory: dir,
+    }
+  }
+
+  async function checkSetupStatus(qrcodeId: string): Promise<Record<string, unknown>> {
+    if (!pendingSetup || pendingSetup.qrcodeId !== qrcodeId) {
+      return { ok: false, status: 'idle', message: '没有进行中的扫码绑定，请先点击“扫码绑定”。' }
+    }
+
+    const result = await checkQrStatus(qrcodeId)
+
+    if (result.status === 'confirmed') {
+      const config = readBridgeConfig()
+      config.workingDirectory = pendingSetup.workingDirectory
+      saveBridgeConfig(config)
+      pendingSetup = undefined
+      return {
+        ok: true,
+        status: 'confirmed',
+        accountId: result.account.accountId,
+        workingDirectory: config.workingDirectory,
+      }
+    }
+
+    if (result.status === 'expired') {
+      pendingSetup = undefined
+      return { ok: false, status: 'expired', message: result.message }
+    }
+
+    if (result.status === 'error') {
+      return { ok: false, status: 'error', message: result.message, retryable: result.retryable }
+    }
+
+    return { ok: true, status: result.status }
+  }
+
   function readDaemonLogs(limit = 100): string {
     try {
       if (!existsSync(daemonLogPath)) return '暂无日志'
@@ -592,6 +680,7 @@ export function apply(ctx: Context, config: Config): void {
       startedAt: bridgeStartedAt ?? null,
       dataDir,
       apiBase: internalPort ? `http://127.0.0.1:${internalPort}` : null,
+      workingDirectory: readBridgeConfig().workingDirectory,
       accounts: accountFiles,
       sessions: [...sessionIds.keys()],
     }
@@ -638,6 +727,35 @@ export function apply(ctx: Context, config: Config): void {
       handler: async (_req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
         res.end(readDaemonLogs(200))
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@dsh-external/dsh-wechat-bridge/setup/start',
+      handler: async (req, res) => {
+        let workingDirectory: string | undefined
+        try {
+          const body = await readBody(req)
+          workingDirectory = typeof body.workingDirectory === 'string' ? body.workingDirectory : undefined
+        } catch {
+          // body optional
+        }
+        const result = await startSetup(workingDirectory)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(result))
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@dsh-external/dsh-wechat-bridge/setup/status',
+      handler: async (req, res) => {
+        const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`)
+        const qrcodeId = url.searchParams.get('qrcodeId') || ''
+        const result = await checkSetupStatus(qrcodeId)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(result))
       },
     }))
 

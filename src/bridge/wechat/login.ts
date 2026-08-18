@@ -22,6 +22,12 @@ interface QrStatusResponse {
   ilink_user_id?: string;
 }
 
+export type QrCheckResult =
+  | { status: 'wait' | 'scaned' }
+  | { status: 'confirmed'; account: AccountData }
+  | { status: 'expired'; message: string }
+  | { status: 'error'; message: string; retryable: boolean };
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -50,86 +56,130 @@ export async function startQrLogin(): Promise<{ qrcodeUrl: string; qrcodeId: str
 }
 
 /**
+ * Check one QR-code status without blocking. Saves the account on success.
+ * This is the non-blocking building block used both by the terminal setup
+ * loop and by the Web settings panel polling.
+ */
+export async function checkQrStatus(qrcodeId: string): Promise<QrCheckResult> {
+  const url = `${QR_STATUS_URL}?qrcode=${encodeURIComponent(qrcodeId)}`;
+
+  logger.debug('Checking QR status', { qrcodeId });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5_000);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+  } catch (e: any) {
+    clearTimeout(timer);
+    const isTimeout = e?.name === 'AbortError' || e?.code === 'ETIMEDOUT';
+    return {
+      status: 'error',
+      message: isTimeout ? 'QR poll timed out' : (e?.message ?? String(e)),
+      retryable: true,
+    };
+  }
+  clearTimeout(timer);
+
+  if (!res.ok) {
+    return {
+      status: 'error',
+      message: `Failed to check QR status: HTTP ${res.status}`,
+      retryable: false,
+    };
+  }
+
+  const data = (await res.json()) as QrStatusResponse;
+  logger.debug('QR status response', { status: data.status });
+
+  switch (data.status) {
+    case 'wait':
+    case 'scaned':
+      return { status: data.status };
+
+    case 'confirmed': {
+      if (!data.bot_token || !data.ilink_bot_id || !data.ilink_user_id) {
+        return {
+          status: 'error',
+          message: 'QR confirmed but missing required fields in response',
+          retryable: false,
+        };
+      }
+
+      const accountData: AccountData = {
+        botToken: data.bot_token,
+        accountId: data.ilink_bot_id,
+        baseUrl: data.baseurl || DEFAULT_BASE_URL,
+        userId: data.ilink_user_id,
+        createdAt: new Date().toISOString(),
+      };
+
+      saveAccount(accountData);
+      logger.info('QR login successful', { accountId: accountData.accountId });
+
+      return { status: 'confirmed', account: accountData };
+    }
+
+    case 'expired': {
+      logger.info('QR code expired');
+      return { status: 'expired', message: 'QR code expired' };
+    }
+
+    default: {
+      logger.warn('Unknown QR status', { status: data.status, retmsg: data.retmsg });
+      // Surface error to user for known failure statuses
+      const status = data.status ?? '';
+      if (status && (
+        status.includes('not_support') ||
+        status.includes('version') ||
+        status.includes('forbid') ||
+        status.includes('reject') ||
+        status.includes('cancel')
+      )) {
+        return {
+          status: 'error',
+          message: `二维码扫描失败: ${data.retmsg || status}`,
+          retryable: false,
+        };
+      }
+      if (data.retmsg) {
+        return {
+          status: 'error',
+          message: `二维码扫描失败: ${data.retmsg}`,
+          retryable: false,
+        };
+      }
+      // Unknown but not fatal: keep waiting.
+      return { status: 'wait' };
+    }
+  }
+}
+
+/**
  * Phase 2: Wait for the user to scan and confirm the QR code.
  * Throws on expiry so the caller can regenerate the QR image.
  * Returns the full AccountData on success.
  */
 export async function waitForQrScan(qrcodeId: string): Promise<AccountData> {
-  let currentQrcodeId = qrcodeId;
-
   while (true) {
-    const url = `${QR_STATUS_URL}?qrcode=${encodeURIComponent(currentQrcodeId)}`;
+    const result = await checkQrStatus(qrcodeId);
 
-    logger.debug('Polling QR status', { qrcodeId: currentQrcodeId });
+    switch (result.status) {
+      case 'confirmed':
+        return result.account;
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 60_000);
-    let res: Response;
-    try {
-      res = await fetch(url, { signal: controller.signal });
-    } catch (e: any) {
-      clearTimeout(timer);
-      if (e.name === 'AbortError' || e.code === 'ETIMEDOUT') {
-        logger.info('QR poll timed out, retrying');
-        continue;
-      }
-      throw e;
-    }
-    clearTimeout(timer);
+      case 'expired':
+        throw new Error(result.message);
 
-    if (!res.ok) {
-      throw new Error(`Failed to check QR status: HTTP ${res.status}`);
-    }
-
-    const data = (await res.json()) as QrStatusResponse;
-    logger.debug('QR status response', { status: data.status });
-
-    switch (data.status) {
-      case 'wait':
-      case 'scaned':
-        // Not yet confirmed, continue polling
-        break;
-
-      case 'confirmed': {
-        if (!data.bot_token || !data.ilink_bot_id || !data.ilink_user_id) {
-          throw new Error('QR confirmed but missing required fields in response');
+      case 'error':
+        if (result.retryable) {
+          logger.info('QR status check failed, retrying', { message: result.message });
+          await sleep(POLL_INTERVAL_MS);
+          continue;
         }
-
-        const accountData: AccountData = {
-          botToken: data.bot_token,
-          accountId: data.ilink_bot_id,
-          baseUrl: data.baseurl || DEFAULT_BASE_URL,
-          userId: data.ilink_user_id,
-          createdAt: new Date().toISOString(),
-        };
-
-        saveAccount(accountData);
-        logger.info('QR login successful', { accountId: accountData.accountId });
-
-        return accountData;
-      }
-
-      case 'expired': {
-        logger.info('QR code expired');
-        throw new Error('QR code expired');
-      }
+        throw new Error(result.message);
 
       default:
-        logger.warn('Unknown QR status', { status: data.status, retmsg: data.retmsg });
-        // Surface error to user for known failure statuses
-        const status = data.status ?? '';
-        if (status && (
-          status.includes('not_support') ||
-          status.includes('version') ||
-          status.includes('forbid') ||
-          status.includes('reject') ||
-          status.includes('cancel')
-        )) {
-          throw new Error(`二维码扫描失败: ${data.retmsg || status}`);
-        }
-        if (data.retmsg) {
-          throw new Error(`二维码扫描失败: ${data.retmsg}`);
-        }
         break;
     }
 

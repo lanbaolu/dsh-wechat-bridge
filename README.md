@@ -73,7 +73,14 @@ npm run typecheck
 
 ### 1. 扫码绑定
 
-在 DSH 所在机器终端执行：
+推荐在 DSH Web 设置页的「📱 微信桥接」面板中完成：
+
+1. 打开 **Settings / 设置** → **📱 微信桥接**。
+2. 填写 DSH 工作目录。
+3. 点击 **扫码绑定**，用微信扫描页面上的二维码。
+4. 绑定成功后直接点击 **启动**。
+
+也可以在 DSH 所在机器终端执行：
 
 ```bash
 node lib/bridge/main.js setup
@@ -90,7 +97,7 @@ node lib/bridge/main.js setup
 - `wechat_bridge_logs`
 - `wechat_bridge_stop`
 
-或者在 Web 面板（`conversation.view` 槽位）点击“启动 / 停止 / 重启”。
+或者在 Web 设置页（`settings.section` 槽位）点击“启动 / 停止 / 重启”。
 
 ### 3. 微信端命令
 
