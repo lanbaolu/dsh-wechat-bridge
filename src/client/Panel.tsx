@@ -81,6 +81,7 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
   const [qrcodeId, setQrcodeId] = useState('')
   const [setupError, setSetupError] = useState('')
   const [boundAccountId, setBoundAccountId] = useState('')
+  const [daemonMessage, setDaemonMessage] = useState('')
 
   const refresh = useCallback(async () => {
     try {
@@ -169,6 +170,7 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
         if (data.status === 'confirmed') {
           setSetupPhase('confirmed')
           setBoundAccountId(data.accountId || '')
+          setDaemonMessage(data.daemon || '')
           void refresh()
           return
         }
@@ -200,6 +202,7 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
     setQrcodeDataUrl('')
     setQrcodeId('')
     setSetupError('')
+    setDaemonMessage('')
   }
 
   const actions: Array<{ label: string; run: () => void; disabled?: boolean }> = [
@@ -253,7 +256,7 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
 
       {setupPhase === 'confirmed' && (
         <div role="status" style={{ marginBottom: 8, color: '#2f9e44' }}>
-          ✅ 绑定成功{boundAccountId ? `：${boundAccountId}` : ''}，可以点击“启动”开始使用。
+          ✅ 绑定成功{boundAccountId ? `：${boundAccountId}` : ''}，{daemonMessage || '桥接已自动重启/启动。'}
         </div>
       )}
 

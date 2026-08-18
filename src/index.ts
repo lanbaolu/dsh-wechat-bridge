@@ -629,11 +629,17 @@ export function apply(ctx: Context, config: Config): void {
       config.workingDirectory = pendingSetup.workingDirectory
       saveBridgeConfig(config)
       pendingSetup = undefined
+
+      // A newly bound account only takes effect after the daemon reloads the
+      // latest account file. Restart when running, otherwise start it so the
+      // user does not have to manually restart after every re-scan.
+      const daemonResult = daemonRunning() ? await restartDaemon() : await startDaemon()
       return {
         ok: true,
         status: 'confirmed',
         accountId: result.account.accountId,
         workingDirectory: config.workingDirectory,
+        daemon: daemonResult.message,
       }
     }
 
