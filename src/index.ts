@@ -1198,7 +1198,7 @@ export function apply(ctx: Context, config: Config): void {
 
     ctx.tools.register(defineTool({
       name: 'wechat_bridge_list_projects',
-      description: '列出 DSH 中可绑定的项目会话（含项目名、路径、会话 ID）。微信桥接会话中可用自然语言让模型调用此工具查看可进入的项目。',
+      description: '列出 DSH 中可进入/可绑定的项目会话（含项目名、路径、会话 ID）。当用户询问“有哪些项目”“看看我有什么项目”“我要看下项目”“我在哪个项目”“想继续某个项目”“有个任务想做”等意图，或用户描述内容可能对应某个项目时，都应调用此工具查看项目，不要要求用户使用固定句式。',
       parameters: {},
       output: {
         schema: {
@@ -1247,7 +1247,7 @@ export function apply(ctx: Context, config: Config): void {
 
     ctx.tools.register(defineTool({
       name: 'wechat_bridge_select_project',
-      description: '进入一个 DSH 项目会话。微信桥接会话中，模型应先调用 wechat_bridge_list_projects 获取 sessionId，再调用本工具切换到对应项目；切换后后续微信对话会记录到该项目。',
+      description: '进入一个 DSH 项目会话。微信桥接会话中，模型应先调用 wechat_bridge_list_projects 获取 sessionId，再调用本工具切换到对应项目；切换后后续微信对话会记录到该项目。支持用户自然语言模糊指代，例如“进入某某项目”“去这个项目”“继续在 XXX 里做”“我现在要做 XXX”等，模型应根据上下文/项目列表选择对应 sessionId。',
       parameters: {
         sessionId: { type: 'string', description: '要进入的项目会话 ID，来自 wechat_bridge_list_projects 返回的 sessionId。' },
       },
