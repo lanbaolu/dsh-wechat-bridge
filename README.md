@@ -67,6 +67,8 @@ npm run build:client # client → lib/client.js
 npm run typecheck
 ```
 
+> 注意：`build:client` 使用 `tsdown`，需要 Node.js 22.18+ 或 24.11+（CI 使用 22/24 验证）。运行时要求仍为 Node 18+。
+
 ## 使用
 
 ### 1. 扫码绑定
