@@ -63,6 +63,12 @@ const inputStyle: React.CSSProperties = {
   minWidth: 220,
 }
 
+const selectStyle: React.CSSProperties = {
+  ...inputStyle,
+  minWidth: 320,
+  maxWidth: '100%',
+}
+
 const hintStyle: React.CSSProperties = {
   marginTop: 8,
   fontSize: 12,
@@ -70,6 +76,23 @@ const hintStyle: React.CSSProperties = {
 }
 
 type SetupPhase = 'idle' | 'starting' | 'qr' | 'confirmed' | 'error'
+
+interface ProjectSessionItem {
+  sessionId: string
+  workspaceId: string
+  workspaceTitle: string
+  path: string
+  cwd?: string
+  createdAt: string
+  live: boolean
+}
+
+interface SelectedProjectInfo {
+  sessionId: string
+  workspaceId: string
+  workspaceTitle: string
+  path: string
+}
 
 export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.Element {
   const [output, setOutput] = useState('加载中…')
@@ -82,15 +105,30 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
   const [setupError, setSetupError] = useState('')
   const [boundAccountId, setBoundAccountId] = useState('')
   const [daemonMessage, setDaemonMessage] = useState('')
+  const [projects, setProjects] = useState<ProjectSessionItem[]>([])
+  const [projectChoice, setProjectChoice] = useState('')
+  const [boundProject, setBoundProject] = useState<SelectedProjectInfo | null>(null)
+  const [projectBusy, setProjectBusy] = useState(false)
+  const [projectMessage, setProjectMessage] = useState('')
+  const [projectError, setProjectError] = useState('')
 
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/status`, { cache: 'no-store' })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
+      const [statusRes, projectsRes] = await Promise.all([
+        fetch(`${API_BASE}/status`, { cache: 'no-store' }),
+        fetch(`${API_BASE}/projects`, { cache: 'no-store' }),
+      ])
+      if (!statusRes.ok) throw new Error(`status HTTP ${statusRes.status}`)
+      if (!projectsRes.ok) throw new Error(`projects HTTP ${projectsRes.status}`)
+      const data = await statusRes.json()
+      const projectsData = await projectsRes.json()
       setOutput(JSON.stringify(data, null, 2))
       if (typeof data.workingDirectory === 'string') {
         setWorkingDir((prev) => prev || data.workingDirectory)
+      }
+      setBoundProject(data.selectedProject ?? null)
+      if (Array.isArray(projectsData.items)) {
+        setProjects(projectsData.items as ProjectSessionItem[])
       }
       setError(null)
     } catch (err) {
@@ -151,6 +189,51 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
     } catch (err) {
       setSetupPhase('error')
       setSetupError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  async function bindProject(): Promise<void> {
+    if (!projectChoice) return
+    setProjectBusy(true)
+    setProjectError('')
+    setProjectMessage('')
+    try {
+      const res = await fetch(`${API_BASE}/projects/select`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: projectChoice }),
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || data?.message || `HTTP ${res.status}`)
+      }
+      const project = data.project as SelectedProjectInfo | undefined
+      setProjectMessage(`已绑定项目会话${project?.workspaceTitle ? `：${project.workspaceTitle}` : ''}${data.daemon ? `（${data.daemon}）` : ''}`)
+      await refresh()
+    } catch (err) {
+      setProjectError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setProjectBusy(false)
+    }
+  }
+
+  async function detachProject(): Promise<void> {
+    setProjectBusy(true)
+    setProjectError('')
+    setProjectMessage('')
+    try {
+      const res = await fetch(`${API_BASE}/projects/detach`, { method: 'POST' })
+      const data = await res.json().catch(() => null)
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || data?.message || `HTTP ${res.status}`)
+      }
+      setProjectMessage(`已解除项目会话绑定${data.daemon ? `（${data.daemon}）` : ''}`)
+      setProjectChoice('')
+      await refresh()
+    } catch (err) {
+      setProjectError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setProjectBusy(false)
     }
   }
 
@@ -230,6 +313,42 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
           style={{ ...inputStyle, marginLeft: 8 }}
         />
       </label>
+
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ ...titleStyle, marginBottom: 4 }}>项目对话绑定</div>
+        <div style={{ fontSize: 12, opacity: 0.8 }}>
+          {boundProject
+            ? `当前绑定：${boundProject.workspaceTitle} · ${boundProject.path} · ${boundProject.sessionId.slice(-8)}`
+            : '当前未绑定：微信消息使用独立桥接会话（也可选择项目对话以共享记忆）。'}
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginTop: 6 }}>
+          <select
+            value={projectChoice}
+            onChange={(e) => setProjectChoice(e.target.value)}
+            style={selectStyle}
+            aria-label="选择要绑定的项目会话"
+          >
+            <option value="">— 选择要绑定的项目会话 —</option>
+            {projects.map((project) => (
+              <option key={project.sessionId} value={project.sessionId}>
+                {project.workspaceTitle} · {project.path} · {project.sessionId.slice(-8)}
+              </option>
+            ))}
+          </select>
+          <button type="button" style={buttonStyle} disabled={!projectChoice || projectBusy} onClick={() => void bindProject()}>
+            绑定
+          </button>
+          <button type="button" style={buttonStyle} disabled={projectBusy || !boundProject} onClick={() => void detachProject()}>
+            解除绑定
+          </button>
+        </div>
+        {projectMessage && (
+          <div role="status" style={{ color: '#2f9e44', marginTop: 6, fontSize: 12 }}>{projectMessage}</div>
+        )}
+        {projectError && (
+          <div role="alert" style={{ color: '#e5484d', marginTop: 6, fontSize: 12 }}>{projectError}</div>
+        )}
+      </div>
 
       {setupPhase === 'starting' && (
         <div role="status" style={{ marginBottom: 8 }}>正在生成二维码…</div>

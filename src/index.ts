@@ -30,6 +30,7 @@ import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-workspace'
 import { startQrLogin, checkQrStatus } from './bridge/wechat/login.js'
+import { loadJson, saveJson, validateAccountId } from './bridge/store.js'
 
 export const name = '@lanbaolu/dsh-wechat-bridge'
 
@@ -75,6 +76,16 @@ interface WebRouteLike {
   kind: 'exact' | 'prefix'
   path: string
   handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+}
+
+interface ProjectSessionItem {
+  sessionId: string
+  workspaceId: string
+  workspaceTitle: string
+  path: string
+  cwd?: string
+  createdAt: string
+  live: boolean
 }
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -151,6 +162,43 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Explicit project-conversation binding (Web panel selection)
+  // -------------------------------------------------------------------------
+
+  const selectedSessionIdPath = join(dataDir, 'selected-sessions.json')
+
+  function loadSelectedSessionIds(): Record<string, string> {
+    try {
+      const raw = JSON.parse(readFileSync(selectedSessionIdPath, 'utf8')) as Record<string, string>
+      return raw && typeof raw === 'object' ? raw : {}
+    } catch {
+      return {}
+    }
+  }
+
+  function saveSelectedSessionIds(map: Record<string, string>): void {
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(selectedSessionIdPath, JSON.stringify(map, null, 2) + '\n', 'utf8')
+  }
+
+  function persistSelectedSessionId(accountId: string, dshSessionId: string): void {
+    validateAccountId(accountId)
+    const map = loadSelectedSessionIds()
+    map[accountId] = dshSessionId
+    saveSelectedSessionIds(map)
+  }
+
+  function removeSelectedSessionId(accountId: string): void {
+    const map = loadSelectedSessionIds()
+    if (accountId in map) {
+      delete map[accountId]
+      saveSelectedSessionIds(map)
+    }
+  }
+
+  const selectedSessionIds = new Map<string, string>(Object.entries(loadSelectedSessionIds()))
+
   function newDshSessionId(accountId: string): string {
     return `wb-${accountId}-${Date.now()}-${randomBytes(4).toString('hex')}`
   }
@@ -179,15 +227,21 @@ export function apply(ctx: Context, config: Config): void {
 
       // Resume the persisted DSH session when possible; create a fresh one only
       // when there is no mapping, the old log is gone/corrupt, or the requested
-      // workspace differs from the persisted session's cwd.
+      // workspace differs from the persisted session's cwd (unless the user
+      // explicitly bound the bridge to a project conversation).
+      const selectedSessionId = selectedSessionIds.get(accountId)
       let dshSessionId = sessionIds.get(accountId)
       let handle: AgentHandle | undefined
       let resumed = false
+      let isSelected = false
+      let selectedCwd: string | undefined
 
+      if (!dshSessionId) dshSessionId = selectedSessionId
       if (!dshSessionId) {
         const sessionMap = loadSessionIdMap()
         dshSessionId = sessionMap[accountId] || undefined
       }
+      isSelected = !!selectedSessionId && dshSessionId === selectedSessionId
 
       if (dshSessionId) {
         try {
@@ -196,11 +250,13 @@ export function apply(ctx: Context, config: Config): void {
             agentOptions,
           })
           const persistedCwd = candidate.agent.session.header.cwd
-          if (input?.cwd && persistedCwd && resolve(input.cwd) !== resolve(persistedCwd)) {
+          selectedCwd = persistedCwd || undefined
+          const cwdMismatch = input?.cwd && persistedCwd && resolve(input.cwd) !== resolve(persistedCwd)
+          if (cwdMismatch && !isSelected) {
             debugLog('resume cwd mismatch, create new', {
               accountId,
               dshSessionId,
-              requested: resolve(input.cwd),
+              requested: resolve(input.cwd!),
               persisted: resolve(persistedCwd),
             })
             await candidate.dispose()
@@ -220,24 +276,43 @@ export function apply(ctx: Context, config: Config): void {
       }
 
       if (!handle) {
+        if (isSelected) {
+          debugLog('selected project session resume failed, clearing binding', {
+            accountId,
+            dshSessionId,
+          })
+          selectedSessionIds.delete(accountId)
+          removeSelectedSessionId(accountId)
+          isSelected = false
+        }
         dshSessionId = newDshSessionId(accountId)
-        debugLog('ensureAgent create', { accountId, dshSessionId, provider, model, selection, resumed: false })
+        debugLog('ensureAgent create', { accountId, dshSessionId, provider, model, selection, resumed: false, selected: false })
         handle = await ctx.agents.create({
           sessionId: SessionId(dshSessionId),
           meta: input?.cwd ? { cwd: resolve(input.cwd) } : undefined,
           agentOptions,
         })
       } else {
-        debugLog('ensureAgent resume', { accountId, dshSessionId, provider, model, selection, resumed: true })
+        debugLog('ensureAgent resume', { accountId, dshSessionId, provider, model, selection, resumed: true, selected: isSelected })
       }
 
       const finalSessionId = dshSessionId!
       sessionIds.set(accountId, finalSessionId)
       persistSessionId(accountId, finalSessionId)
+      if (isSelected) {
+        persistSelectedSessionId(accountId, finalSessionId)
+      } else if (selectedSessionIds.has(accountId)) {
+        selectedSessionIds.delete(accountId)
+        removeSelectedSessionId(accountId)
+      }
       agents.set(accountId, handle)
       activeSessionIds.add(finalSessionId)
-      debugLog('agent ready', { accountId, dshSessionId: finalSessionId, provider, model, selection, resumed })
-      if (input?.cwd) await attachSessionToWorkspace(finalSessionId, resolve(input.cwd))
+      debugLog('agent ready', { accountId, dshSessionId: finalSessionId, provider, model, selection, resumed, selected: isSelected })
+      if (isSelected && selectedCwd) {
+        await attachSessionToWorkspace(finalSessionId, selectedCwd)
+      } else if (input?.cwd) {
+        await attachSessionToWorkspace(finalSessionId, resolve(input.cwd))
+      }
       return handle
     })()
 
@@ -256,6 +331,10 @@ export function apply(ctx: Context, config: Config): void {
     sessionIds.delete(accountId)
     agents.delete(accountId)
     removePersistedSessionId(accountId)
+    if (selectedSessionIds.has(accountId)) {
+      selectedSessionIds.delete(accountId)
+      removeSelectedSessionId(accountId)
+    }
     if (handle) await handle.dispose()
     closeStreams(accountId)
   }
@@ -279,6 +358,184 @@ export function apply(ctx: Context, config: Config): void {
         error: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Project conversation selection (Web panel)
+  // -------------------------------------------------------------------------
+
+  function latestAccountId(): string | undefined {
+    try {
+      const accountsDir = join(dataDir, 'accounts')
+      const files = readdirSync(accountsDir).filter((file) => file.endsWith('.json'))
+      if (files.length === 0) return undefined
+      let latestFile = files[0]
+      let latestMtime = 0
+      for (const file of files) {
+        const stat = statSync(join(accountsDir, file))
+        if (stat.mtimeMs > latestMtime) {
+          latestMtime = stat.mtimeMs
+          latestFile = file
+        }
+      }
+      return latestFile.replace(/\.json$/, '')
+    } catch {
+      return undefined
+    }
+  }
+
+  async function listProjectSessions(): Promise<ProjectSessionItem[]> {
+    const registry = ctx.get('workspaceRegistry') as
+      | { list(): Array<{ id: string; path: string; title: string; sessionIds: readonly unknown[]; createdAt: string }> }
+      | undefined
+    if (!registry?.list) return []
+
+    const sessionsService = ctx.get('sessions') as
+      | { list(): Array<{ id: unknown; header: { id?: unknown; cwd?: string; createdAt?: string } }> }
+      | undefined
+    const persistence = ctx.get('sessionPersistence') as
+      | { listSnapshots?: () => Promise<Array<{ header: { id: unknown; cwd?: string; createdAt?: string } }>> }
+      | undefined
+
+    const headerById = new Map<string, { cwd?: string; createdAt?: string }>()
+    const liveIds = new Set<string>()
+
+    for (const session of sessionsService?.list() ?? []) {
+      const id = String(session.id ?? session.header.id)
+      if (!id) continue
+      liveIds.add(id)
+      headerById.set(id, {
+        cwd: session.header.cwd,
+        createdAt: session.header.createdAt,
+      })
+    }
+
+    if (persistence?.listSnapshots) {
+      try {
+        for (const snap of await persistence.listSnapshots()) {
+          const id = String(snap.header.id)
+          if (!id) continue
+          if (!headerById.has(id)) {
+            headerById.set(id, {
+              cwd: snap.header.cwd,
+              createdAt: snap.header.createdAt,
+            })
+          }
+        }
+      } catch (err) {
+        debugLog('listProjectSessions snapshots failed', { error: err instanceof Error ? err.message : String(err) })
+      }
+    }
+
+    const items: ProjectSessionItem[] = []
+    for (const ws of registry.list()) {
+      for (const sid of ws.sessionIds) {
+        const sessionId = String(sid)
+        const header = headerById.get(sessionId)
+        items.push({
+          sessionId,
+          workspaceId: ws.id,
+          workspaceTitle: ws.title,
+          path: ws.path,
+          cwd: header?.cwd || ws.path,
+          createdAt: header?.createdAt || ws.createdAt,
+          live: liveIds.has(sessionId),
+        })
+      }
+    }
+    return items
+  }
+
+  async function selectedProjectPayload(accountId?: string): Promise<Record<string, unknown> | null> {
+    const target = accountId || latestAccountId()
+    if (!target) return null
+    const selectedId = selectedSessionIds.get(target)
+    if (!selectedId) return null
+    const items = await listProjectSessions()
+    const item = items.find((candidate) => candidate.sessionId === selectedId)
+    if (!item) return null
+    return {
+      sessionId: selectedId,
+      workspaceId: item.workspaceId,
+      workspaceTitle: item.workspaceTitle,
+      path: item.path,
+    }
+  }
+
+  function readBridgeAccountSession(accountId: string): Record<string, unknown> {
+    validateAccountId(accountId)
+    return loadJson<Record<string, unknown>>(join(dataDir, 'sessions', `${accountId}.json`), {})
+  }
+
+  function writeBridgeAccountSession(accountId: string, session: Record<string, unknown>): void {
+    validateAccountId(accountId)
+    saveJson(join(dataDir, 'sessions', `${accountId}.json`), session)
+  }
+
+  function resetBridgeAccountSession(accountId: string, cwd: string): void {
+    const session = readBridgeAccountSession(accountId)
+    session.workingDirectory = cwd
+    session.state = 'idle'
+    session.chatHistory = []
+    writeBridgeAccountSession(accountId, session)
+  }
+
+  async function selectProjectSession(dshSessionId: string, accountId?: string): Promise<Record<string, unknown>> {
+    const target = accountId || latestAccountId()
+    if (!target) return { ok: false, error: '没有已绑定的微信账号，请先扫码绑定。' }
+    const items = await listProjectSessions()
+    const item = items.find((candidate) => candidate.sessionId === dshSessionId)
+    if (!item) return { ok: false, error: '指定的会话不存在或不属于任何项目。' }
+
+    // If the user is re-selecting the conversation the bridge already owns,
+    // treat it as a no-op instead of disposing the live agent.
+    const currentDshSessionId = sessionIds.get(target)
+    if (dshSessionId === currentDshSessionId) {
+      return {
+        ok: true,
+        accountId: target,
+        selectedSessionId: dshSessionId,
+        project: item,
+        daemon: '已经绑定到该项目会话。',
+      }
+    }
+
+    // A live DSH session can only be owned by one agent loop. If the selected
+    // conversation is currently open in the DSH UI, refuse before touching the
+    // current bridge agent instead of silently falling back on the next message.
+    const sessionsService = ctx.get('sessions') as { get(id: unknown): unknown } | undefined
+    if (sessionsService?.get(SessionId(dshSessionId))) {
+      return { ok: false, error: '该会话当前正在 DSH 中打开，请先在 DSH 中关闭该会话后再绑定。' }
+    }
+
+    // Drop the current bridge-owned agent so the next message resumes the
+    // selected project conversation instead of the previous bridge session.
+    if (agents.has(target) || sessionIds.has(target)) {
+      await disposeAgent(target)
+    }
+
+    selectedSessionIds.set(target, dshSessionId)
+    persistSelectedSessionId(target, dshSessionId)
+    resetBridgeAccountSession(target, item.path)
+
+    const daemonResult = daemonRunning() ? await restartDaemon() : { ok: true, message: '守护进程未运行，绑定将在下次启动时生效。' }
+    return {
+      ok: true,
+      accountId: target,
+      selectedSessionId: dshSessionId,
+      project: item,
+      daemon: daemonResult.message,
+    }
+  }
+
+  async function detachProjectSession(accountId?: string): Promise<Record<string, unknown>> {
+    const target = accountId || latestAccountId()
+    if (!target) return { ok: false, error: '没有已绑定的微信账号。' }
+    await disposeAgent(target)
+    const config = readBridgeConfig()
+    resetBridgeAccountSession(target, config.workingDirectory)
+    const daemonResult = daemonRunning() ? await restartDaemon() : { ok: true, message: '守护进程未运行，解除绑定将在下次启动时生效。' }
+    return { ok: true, accountId: target, daemon: daemonResult.message }
   }
 
   // -------------------------------------------------------------------------
@@ -689,6 +946,7 @@ export function apply(ctx: Context, config: Config): void {
       workingDirectory: readBridgeConfig().workingDirectory,
       accounts: accountFiles,
       sessions: [...sessionIds.keys()],
+      selectedProject: await selectedProjectPayload(),
     }
   }
 
@@ -733,6 +991,53 @@ export function apply(ctx: Context, config: Config): void {
       handler: async (_req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
         res.end(readDaemonLogs(200))
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/projects',
+      handler: async (_req, res) => {
+        const result = await listProjectSessions()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, items: result }))
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/projects/select',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req)
+          const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+          const accountId = typeof body.accountId === 'string' && body.accountId ? body.accountId : undefined
+          const result = await selectProjectSession(sessionId, accountId)
+          res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(result))
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: message }))
+        }
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/projects/detach',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req).catch(() => ({}))
+          const accountId = body && typeof body.accountId === 'string' && body.accountId ? body.accountId : undefined
+          const result = await detachProjectSession(accountId)
+          res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(result))
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: message }))
+        }
       },
     }))
 
