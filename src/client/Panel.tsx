@@ -1,6 +1,6 @@
 import type * as React from 'react'
 import { useCallback, useEffect, useState } from 'react'
-import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
 
 const API_BASE = '/@dsh-external/dsh-wechat-bridge'
 
@@ -58,7 +58,7 @@ const hintStyle: React.CSSProperties = {
   opacity: 0.7,
 }
 
-export function WechatBridgePanel(_props: ConvViewProps): React.JSX.Element {
+export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.Element {
   const [output, setOutput] = useState('加载中…')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
