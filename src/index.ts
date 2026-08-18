@@ -911,7 +911,23 @@ export function apply(ctx: Context, config: Config): void {
     registerTools()
     const webDisposers = registerWebRoutes()
 
+    // Watchdog: after sleep/wake or an unexpected daemon exit, automatically
+    // bring the bridge back instead of requiring the user to click Start.
+    let healthTimer: ReturnType<typeof setInterval> | undefined
+    if (config.autoStart) {
+      healthTimer = setInterval(() => {
+        if (daemonRunning()) return
+        startDaemon().then(result => {
+          ctx.logger?.info?.('[dsh-wechat-bridge] watchdog auto-start', result)
+        }).catch(err => {
+          ctx.logger?.warn?.('[dsh-wechat-bridge] watchdog auto-start failed', { error: String(err) })
+        })
+      }, 15_000)
+      healthTimer.unref?.()
+    }
+
     return () => {
+      if (healthTimer) clearInterval(healthTimer)
       for (const dispose of webDisposers) dispose()
       for (const handle of agents.values()) {
         void handle.dispose()
