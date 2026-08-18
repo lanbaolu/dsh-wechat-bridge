@@ -1,7 +1,7 @@
 # dsh-wechat-bridge — installable DSH profile bundle layer.
 - insert:
     - id: dsh-wechat-bridge
-      name: '@dsh-external/dsh-wechat-bridge'
+      name: '@lanbaolu/dsh-wechat-bridge'
       config:
         dataDir: ''
         host: '127.0.0.1'

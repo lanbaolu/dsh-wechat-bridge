@@ -2,7 +2,7 @@ import type * as React from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
 
-const API_BASE = '/@dsh-external/dsh-wechat-bridge'
+const API_BASE = '/@lanbaolu/dsh-wechat-bridge'
 
 const panelStyle: React.CSSProperties = {
   padding: '14px 16px',

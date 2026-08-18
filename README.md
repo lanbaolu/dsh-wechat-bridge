@@ -1,4 +1,4 @@
-# @dsh-external/dsh-wechat-bridge
+# @lanbaolu/dsh-wechat-bridge
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)
@@ -38,11 +38,19 @@
 
 - `src/bridge/`：从 wechat-claude-code 移植的微信协议层 + 适配 DSH 的守护进程。
 - `src/index.ts`：DSH Host 插件，负责内部 API、Agent 生命周期、守护进程管理和模型工具。
-- `src/client/index.ts`：Web 管理面板（`conversation.view` 槽位）。
+- `src/client/index.ts`：Web 管理面板（`settings.section` 槽位）。
 
 ## 安装
 
-### 方式一：本地路径安装（推荐开发/个人使用）
+### 方式一：npm 一键安装（推荐）
+
+```bash
+npm install @lanbaolu/dsh-wechat-bridge
+dsh plugin --profile web add @lanbaolu/dsh-wechat-bridge
+dsh web
+```
+
+### 方式二：本地路径安装（开发/个人使用）
 
 在 DSH profile 中安装本地包：
 
@@ -58,7 +66,7 @@ dsh web
 dev_inject_plugin /path/to/dsh-wechat-bridge
 ```
 
-### 方式二：从源码运行
+### 方式三：从源码运行
 
 ```bash
 npm install

@@ -1,9 +1,11 @@
 {
-  "name": "@dsh-external/dsh-wechat-bridge",
+  "name": "@lanbaolu/dsh-wechat-bridge",
   "version": "0.1.0",
   "description": "基于 wechat-claude-code 的 DSH 微信桥接插件：三端通用（Windows/macOS/Linux），host 工具 + Web 管理面板",
-  "private": true,
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18"
   },

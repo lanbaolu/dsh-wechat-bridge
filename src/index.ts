@@ -1,5 +1,5 @@
 /**
- * @dsh-external/dsh-wechat-bridge — DSH 微信桥接插件（hybrid）。
+ * @lanbaolu/dsh-wechat-bridge — DSH 微信桥接插件（hybrid）。
  *
  * Host 侧：
  *  - 启动一个仅监听 127.0.0.1 的内部 HTTP + SSE 服务，供桥接守护进程调用；
@@ -31,7 +31,7 @@ import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-workspace'
 import { startQrLogin, checkQrStatus } from './bridge/wechat/login.js'
 
-export const name = '@dsh-external/dsh-wechat-bridge'
+export const name = '@lanbaolu/dsh-wechat-bridge'
 
 /** Host services the plugin needs. `webServer` is optional (headless profiles). */
 export const inject = ['tools', 'agents', 'agentDefaultModel']
@@ -700,7 +700,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@dsh-external/dsh-wechat-bridge/status',
+      path: '/@lanbaolu/dsh-wechat-bridge/status',
       handler: async (_req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(await statusPayload()))
@@ -710,7 +710,7 @@ export function apply(ctx: Context, config: Config): void {
     for (const action of ['start', 'stop', 'restart'] as const) {
       disposers.push(webServer.register({
         kind: 'exact',
-        path: `/@dsh-external/dsh-wechat-bridge/${action}`,
+        path: `/@lanbaolu/dsh-wechat-bridge/${action}`,
         handler: async (_req, res) => {
           const result = action === 'start' ? await startDaemon()
             : action === 'stop' ? await stopDaemon()
@@ -723,7 +723,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@dsh-external/dsh-wechat-bridge/logs',
+      path: '/@lanbaolu/dsh-wechat-bridge/logs',
       handler: async (_req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
         res.end(readDaemonLogs(200))
@@ -732,7 +732,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@dsh-external/dsh-wechat-bridge/setup/start',
+      path: '/@lanbaolu/dsh-wechat-bridge/setup/start',
       handler: async (req, res) => {
         let workingDirectory: string | undefined
         try {
@@ -749,7 +749,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@dsh-external/dsh-wechat-bridge/setup/status',
+      path: '/@lanbaolu/dsh-wechat-bridge/setup/status',
       handler: async (req, res) => {
         const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`)
         const qrcodeId = url.searchParams.get('qrcodeId') || ''
