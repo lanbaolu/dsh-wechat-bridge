@@ -32,3 +32,6 @@ logs/
 # local runtime data (kept outside the repo by default)
 data/
 wechat-bridge-data/
+
+# local CLI tool state
+.opencode/

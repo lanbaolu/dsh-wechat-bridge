@@ -57,7 +57,7 @@ export const Config = z.object({
   dataDir: z.string().default(''),
   host: z.string().default('127.0.0.1'),
   port: z.number().min(0).max(65535).default(0),
-  autoStart: z.boolean().default(false),
+  autoStart: z.boolean().default(true),
   provider: z.string().default(''),
   model: z.string().default(''),
   workingDirectory: z.string().default(''),
