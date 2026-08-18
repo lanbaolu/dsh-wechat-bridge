@@ -1,0 +1,34 @@
+# dependencies
+node_modules/
+
+# build output
+lib/
+dist/
+*.tsbuildinfo
+*.tgz
+
+# local environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# logs
+*.log
+logs/
+
+# DSH internal agent workspace (not part of the published source)
+.dshwolf/
+
+# local runtime data (kept outside the repo by default)
+data/
+wechat-bridge-data/
