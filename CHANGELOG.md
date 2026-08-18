@@ -10,3 +10,7 @@
 - Web 管理面板（`conversation.view` 槽位）。
 - 流式回复批量发送、超时安抚、消息队列、斜杠命令。
 - DSH 会话 ID 持久化映射，跨 DSH Host 重启尝试 `resume`。
+
+### Fixed
+
+- 修复 `conversation.view` 管理面板空白：将非 React 的 `{ render() }` 注册改为真正的 React 组件。
