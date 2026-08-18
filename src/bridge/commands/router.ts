@@ -1,6 +1,7 @@
 import type { Session } from '../session.js';
+import type { DshProjectSession } from '../dsh-client.js';
 import { logger } from '../logger.js';
-import { handleHelp, handleClear, handleNew, handleCwd, handleModel, handleStatus, handleHistory, handleReset, handleUndo, handleVersion, handlePrompt, handleSend, handleUnknown } from './handlers.js';
+import { handleHelp, handleClear, handleNew, handleCwd, handleModel, handleStatus, handleHistory, handleReset, handleUndo, handleVersion, handlePrompt, handleSend, handleSession, handleSessionList, handleUnknown } from './handlers.js';
 
 export interface CommandContext {
   accountId: string;
@@ -9,6 +10,10 @@ export interface CommandContext {
   clearSession: () => Session;
   getChatHistoryText?: (limit?: number) => string;
   text: string;
+  listProjects?: () => Promise<DshProjectSession[]>;
+  selectProject?: (sessionId: string) => Promise<Record<string, unknown>>;
+  detachProject?: () => Promise<Record<string, unknown>>;
+  getStatus?: () => Promise<Record<string, unknown>>;
 }
 
 export interface CommandResult {
@@ -28,7 +33,7 @@ export interface CommandResult {
  *   /status   - Show current session info
  *   /history  - Show recent conversation history
  */
-export function routeCommand(ctx: CommandContext): CommandResult {
+export async function routeCommand(ctx: CommandContext): Promise<CommandResult> {
   const text = ctx.text.trim();
 
   if (!text.startsWith('/')) {
@@ -64,6 +69,12 @@ export function routeCommand(ctx: CommandContext): CommandResult {
       return handleUndo(ctx, args);
     case 'send':
       return handleSend(ctx, args);
+    case 'sessionlist':
+    case 'sessions':
+    case 'projects':
+      return handleSessionList(ctx);
+    case 'session':
+      return handleSession(ctx, args);
     case 'version':
     case 'v':
       return handleVersion();

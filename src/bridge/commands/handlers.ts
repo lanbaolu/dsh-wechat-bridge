@@ -1,4 +1,5 @@
 import type { CommandContext, CommandResult } from './router.js';
+import type { DshProjectSession } from '../dsh-client.js';
 import { loadConfig, saveConfig } from '../config.js';
 import { DEFAULT_WORKING_DIR } from '../constants.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
@@ -25,6 +26,10 @@ const HELP_TEXT = `可用命令：
   /cwd [路径]       查看或切换工作目录
   /model [名称]     查看或切换模型
   /prompt [内容]    查看或设置系统提示词（全局生效）
+
+项目绑定：
+  /sessionlist      列出可绑定的 DSH 项目会话
+  /session [序号|ID|off]  绑定项目会话 / 查看当前 / 解除绑定
 
 其他：
   /version          查看版本信息
@@ -165,6 +170,103 @@ export function handleSend(ctx: CommandContext, args: string): CommandResult {
   }
 
   return { handled: true, sendFile: resolved };
+}
+
+function formatProjectLine(project: DshProjectSession, index: number): string {
+  return `${index + 1}. ${project.workspaceTitle} · ${project.path} · ${project.sessionId.slice(-8)}`;
+}
+
+export async function handleSessionList(ctx: CommandContext): Promise<CommandResult> {
+  if (!ctx.listProjects) {
+    return { reply: '当前守护进程不支持项目会话列表（请升级插件并重启桥接）。', handled: true };
+  }
+  try {
+    const projects = await ctx.listProjects();
+    if (projects.length === 0) {
+      return { reply: '没有可绑定的项目会话。\n请先在 DSH Web 端创建/打开一个项目对话。', handled: true };
+    }
+    const lines = projects.map(formatProjectLine);
+    return {
+      reply: `📁 可绑定项目会话（共 ${projects.length} 个）:\n\n${lines.join('\n')}\n\n绑定：/session <序号或ID>\n解除：/session off`,
+      handled: true,
+    };
+  } catch (err) {
+    return { reply: `⚠️ 获取项目会话失败：${err instanceof Error ? err.message : String(err)}`, handled: true };
+  }
+}
+
+export async function handleSession(ctx: CommandContext, args: string): Promise<CommandResult> {
+  const arg = args.trim();
+
+  if (!arg) {
+    if (!ctx.getStatus) {
+      return { reply: '用法: /session <序号或ID>\n查看列表: /sessionlist', handled: true };
+    }
+    try {
+      const status = await ctx.getStatus();
+      const selected = (status as { selectedProject?: { workspaceTitle?: string; path?: string; sessionId?: string } | null }).selectedProject;
+      if (selected?.sessionId) {
+        return {
+          reply: `当前绑定：${selected.workspaceTitle || ''} · ${selected.path || ''} · ${selected.sessionId.slice(-8)}\n解除绑定：/session off`,
+          handled: true,
+        };
+      }
+      return { reply: '当前未绑定项目会话。\n查看列表：/sessionlist\n绑定：/session <序号或ID>', handled: true };
+    } catch (err) {
+      return { reply: `⚠️ 获取状态失败：${err instanceof Error ? err.message : String(err)}`, handled: true };
+    }
+  }
+
+  const lower = arg.toLowerCase();
+  if (lower === 'off' || lower === 'detach' || lower === 'unbind' || lower === '解除') {
+    if (!ctx.detachProject) {
+      return { reply: '当前守护进程不支持解除绑定。', handled: true };
+    }
+    try {
+      const result = await ctx.detachProject();
+      return {
+        reply: `✅ 已解除项目会话绑定${result.daemon ? `（${result.daemon}）` : ''}`,
+        handled: true,
+      };
+    } catch (err) {
+      return { reply: `⚠️ 解除绑定失败：${err instanceof Error ? err.message : String(err)}`, handled: true };
+    }
+  }
+
+  if (!ctx.listProjects || !ctx.selectProject) {
+    return { reply: '当前守护进程不支持项目绑定（请升级插件并重启桥接）。', handled: true };
+  }
+
+  try {
+    const projects = await ctx.listProjects();
+    if (projects.length === 0) {
+      return { reply: '没有可绑定的项目会话。', handled: true };
+    }
+
+    let target: DshProjectSession | undefined;
+    if (/^\d+$/.test(arg)) {
+      target = projects[parseInt(arg, 10) - 1];
+    } else {
+      target = projects.find((p) =>
+        p.sessionId === arg
+        || p.sessionId.endsWith(arg)
+        || p.workspaceTitle === arg
+        || p.path.includes(arg),
+      );
+    }
+
+    if (!target) {
+      return { reply: `未找到匹配的项目会话：${arg}\n查看列表：/sessionlist`, handled: true };
+    }
+
+    const result = await ctx.selectProject(target.sessionId);
+    return {
+      reply: `✅ 已绑定项目会话：${target.workspaceTitle} · ${target.path}${result.daemon ? `\n${result.daemon}` : ''}`,
+      handled: true,
+    };
+  } catch (err) {
+    return { reply: `⚠️ 绑定失败：${err instanceof Error ? err.message : String(err)}`, handled: true };
+  }
 }
 
 export function handleUnknown(cmd: string, _args: string): CommandResult {

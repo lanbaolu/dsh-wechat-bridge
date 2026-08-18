@@ -24,6 +24,16 @@ export interface DshStreamEvent {
   turn?: number;
 }
 
+export interface DshProjectSession {
+  sessionId: string;
+  workspaceId: string;
+  workspaceTitle: string;
+  path: string;
+  cwd?: string;
+  createdAt: string;
+  live: boolean;
+}
+
 export class DshClient {
   private readonly baseUrl: string;
   private readonly token: string;
@@ -79,6 +89,46 @@ export class DshClient {
       body: JSON.stringify({ sessionId }),
       signal: AbortSignal.timeout(10_000),
     });
+  }
+
+  async listProjects(): Promise<DshProjectSession[]> {
+    const res = await fetch(`${this.baseUrl}/api/projects`, {
+      headers: this.headers(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      throw new Error(`projects HTTP ${res.status}: ${await res.text()}`);
+    }
+    const data = await res.json() as { items?: DshProjectSession[] };
+    return Array.isArray(data.items) ? data.items : [];
+  }
+
+  async selectProject(sessionId: string): Promise<Record<string, unknown>> {
+    const res = await fetch(`${this.baseUrl}/api/projects/select`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({ sessionId }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = await res.json().catch(() => ({})) as Record<string, unknown>;
+    if (!res.ok || data.ok === false) {
+      throw new Error((data.error as string) || (data.message as string) || `select HTTP ${res.status}`);
+    }
+    return data;
+  }
+
+  async detachProject(): Promise<Record<string, unknown>> {
+    const res = await fetch(`${this.baseUrl}/api/projects/detach`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = await res.json().catch(() => ({})) as Record<string, unknown>;
+    if (!res.ok || data.ok === false) {
+      throw new Error((data.error as string) || (data.message as string) || `detach HTTP ${res.status}`);
+    }
+    return data;
   }
 
   /**

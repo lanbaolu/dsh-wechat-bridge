@@ -627,6 +627,25 @@ export function apply(ctx: Context, config: Config): void {
         return
       }
 
+      if (req.method === 'GET' && url.pathname === '/api/projects') {
+        sendJson(res, 200, { ok: true, items: await listProjectSessions() })
+        return
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/projects/select') {
+        const body = await readBody(req)
+        const sessionId = String(body.sessionId || '')
+        const result = await selectProjectSession(sessionId)
+        sendJson(res, result.ok ? 200 : 400, result)
+        return
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/projects/detach') {
+        const result = await detachProjectSession()
+        sendJson(res, result.ok ? 200 : 400, result)
+        return
+      }
+
       if (req.method === 'POST' && url.pathname === '/api/prompt') {
         const body = await readBody(req)
         const sessionId: string = String(body.sessionId || 'default')

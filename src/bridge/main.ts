@@ -381,9 +381,13 @@ async function handleMessage(
       clearSession: () => sessionStore.clear(account.accountId),
       getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
       text: userText,
+      listProjects: () => client.listProjects(),
+      selectProject: (sessionId: string) => client.selectProject(sessionId),
+      detachProject: () => client.detachProject(),
+      getStatus: () => client.status(),
     };
 
-    const result: CommandResult = routeCommand(ctx);
+    const result: CommandResult = await routeCommand(ctx);
 
     if (result.handled && result.reply) {
       await sender.sendText(fromUserId, contextToken, result.reply);
