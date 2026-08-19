@@ -19,6 +19,7 @@
 - 每个微信账号对应一个 DSH 会话，DSH Host 重启后会自动 `resume` 原持久化会话，对话上下文不断档；`/clear`、`/new`、`/stop`、`/cwd`、`/model`、`/prompt` 等斜杠命令可用。
 - 流式回复：DSH Agent 的 `assistant/chunk` 通过本地 SSE 推送到微信（批量发送，不刷屏）。
 - 超时安抚：DSH 超过 5 分钟无输出时自动发一条“还在处理”的消息。
+- 主动通知：agent 可通过 `wechat_notify` 工具在任务完成 / 失败 / 需要确认时主动推送微信，内置节流（每小时 ≤6 条、每日 ≤50 条，超限排队延迟发送），规避个人号风控。
 - 文件双向：微信发图片/文件给 DSH；DSH 回复中提到的本地文件会自动推回微信。
 - 消息队列：处理中收到的普通消息会排队，等当前任务结束后继续处理。
 
@@ -132,6 +133,8 @@ node lib/bridge/main.js setup
 ├── sessions/       # 每个微信账号的本地会话状态
 ├── session-ids.json # 微信账号 → DSH 持久化会话 ID 映射（用于重启后 resume）
 ├── pending-queue/  # 发送失败暂存队列
+├── daemon-port.json # 守护进程 notify 端点端口（token 鉴权）
+├── notify-stats.json # 主动通知每日配额计数
 ├── config.json     # 工作目录 / 模型 / 系统提示词
 └── logs/           # 运行日志
 ```

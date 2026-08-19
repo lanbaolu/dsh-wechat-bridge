@@ -1,3 +1,4 @@
+import { createServer } from 'node:http';
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
@@ -19,12 +20,19 @@ import { DATA_DIR } from './constants.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
 import { loadPendingQueue, savePendingQueue, type PendingItem } from './pending-queue.js';
 import { DshClient, type DshStreamEvent } from './dsh-client.js';
+import { createNotifyThrottle } from './notify.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const MAX_MESSAGE_LENGTH = 4000;
+
+/**
+ * Most recent WeChat user the daemon talked to (the bound user).
+ * Fallback target for proactive notifications when account.userId is empty.
+ */
+let lastActiveUserId = '';
 
 /** Extensions eligible for auto-push when detected in DSH's response text. */
 const AUTO_PUSH_EXTENSIONS = new Set([
@@ -269,6 +277,60 @@ async function runDaemon(): Promise<void> {
   }
 
   const sender = createSender(api, account.accountId);
+  lastActiveUserId = account.userId || '';
+
+  // -------------------------------------------------------------------------
+  // Proactive notification endpoint (DSH → daemon), throttled.
+  // WeChat personal accounts are sensitive to proactive high-frequency pushes,
+  // so notifications go through a queue + rate limits (see notify.ts).
+  // -------------------------------------------------------------------------
+  const notifyThrottle = createNotifyThrottle((message) =>
+    sender.sendText(lastActiveUserId, '', message));
+  const notifyPortPath = join(DATA_DIR, 'daemon-port.json');
+  const notifyServer = createServer((req, res) => {
+    const token = process.env.DSH_BRIDGE_API_TOKEN;
+    if (!token || req.headers['x-dsh-bridge-token'] !== token) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    if (req.method === 'GET' && (req.url === '/notify/status' || req.url === '/notify/status/')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(notifyThrottle.getStatus()));
+      return;
+    }
+    if (req.method !== 'POST' || (req.url !== '/notify' && req.url !== '/notify/')) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'not found' }));
+      return;
+    }
+    let body = '';
+    req.on('data', (chunk: Buffer) => {
+      body += chunk;
+      if (body.length > 64 * 1024) req.destroy();
+    });
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body) as { message?: unknown };
+        const result = notifyThrottle.enqueue(String(parsed?.message ?? ''));
+        res.writeHead(result.accepted ? 200 : 400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'bad request' }));
+      }
+    });
+  });
+
+  await new Promise<void>((resolve) => notifyServer.listen(0, '127.0.0.1', resolve));
+  const notifyPort = (notifyServer.address() as { port: number }).port;
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(notifyPortPath, JSON.stringify({ port: notifyPort, token: process.env.DSH_BRIDGE_API_TOKEN }, null, 2) + '\n', 'utf8');
+    logger.info('Proactive notify endpoint ready', { port: notifyPort });
+  } catch (err) {
+    logger.warn('Failed to persist notify endpoint info', { error: err instanceof Error ? err.message : String(err) });
+  }
   const messageQueue: WeixinMessage[] = [];
   let processingQueue = false;
 
@@ -324,6 +386,9 @@ async function runDaemon(): Promise<void> {
   function shutdown(): void {
     logger.info('Shutting down...');
     monitor.stop();
+    notifyServer.close();
+    notifyThrottle.stop();
+    try { unlinkSync(notifyPortPath); } catch { /* ignore */ }
     process.exit(0);
   }
 
@@ -356,6 +421,7 @@ async function handleMessage(
 
   const contextToken = msg.context_token ?? '';
   const fromUserId = msg.from_user_id;
+  lastActiveUserId = fromUserId;
 
   const userText = extractTextFromItems(msg.item_list);
   const imageItem = extractFirstImageUrl(msg.item_list);

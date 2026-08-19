@@ -94,6 +94,15 @@ interface SelectedProjectInfo {
   path: string
 }
 
+interface NotifyStatus {
+  dailySent: number
+  dailyLimit: number
+  hourlySent: number
+  hourlyLimit: number
+  pendingCount: number
+  queueCapacity: number
+}
+
 export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.Element {
   const [output, setOutput] = useState('加载中…')
   const [error, setError] = useState<string | null>(null)
@@ -111,17 +120,25 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
   const [projectBusy, setProjectBusy] = useState(false)
   const [projectMessage, setProjectMessage] = useState('')
   const [projectError, setProjectError] = useState('')
+  const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [statusRes, projectsRes] = await Promise.all([
+      const [statusRes, projectsRes, notifyRes] = await Promise.all([
         fetch(`${API_BASE}/status`, { cache: 'no-store' }),
         fetch(`${API_BASE}/projects`, { cache: 'no-store' }),
+        fetch(`${API_BASE}/notify/status`, { cache: 'no-store' }),
       ])
       if (!statusRes.ok) throw new Error(`status HTTP ${statusRes.status}`)
       if (!projectsRes.ok) throw new Error(`projects HTTP ${projectsRes.status}`)
       const data = await statusRes.json()
       const projectsData = await projectsRes.json()
+      const notifyData = await notifyRes.json().catch(() => null)
+      if (notifyData && typeof notifyData === 'object' && typeof (notifyData as { data?: NotifyStatus }).data?.dailyLimit === 'number') {
+        setNotifyStatus((notifyData as { data: NotifyStatus }).data)
+      } else if (notifyData && typeof (notifyData as NotifyStatus).dailyLimit === 'number') {
+        setNotifyStatus(notifyData as NotifyStatus)
+      }
       setOutput(JSON.stringify(data, null, 2))
       if (typeof data.workingDirectory === 'string') {
         setWorkingDir((prev) => prev || data.workingDirectory)
@@ -347,6 +364,22 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
         )}
         {projectError && (
           <div role="alert" style={{ color: '#e5484d', marginTop: 6, fontSize: 12 }}>{projectError}</div>
+        )}
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ ...titleStyle, marginBottom: 4 }}>主动通知节流</div>
+        {notifyStatus ? (
+          <div style={{ fontSize: 12, opacity: 0.85 }}>
+            今日已发 <strong>{notifyStatus.dailySent}</strong> / {notifyStatus.dailyLimit} 条 · 近一小时{' '}
+            <strong>{notifyStatus.hourlySent}</strong> / {notifyStatus.hourlyLimit} 条 · 排队中{' '}
+            <strong>{notifyStatus.pendingCount}</strong> 条
+            <div style={{ marginTop: 4, fontSize: 12, opacity: 0.7 }}>
+              agent 通过 wechat_notify 主动推送的通知，超限自动排队延迟发送，避免触发微信风控。
+            </div>
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, opacity: 0.7 }}>守护进程未运行，暂无数据。</div>
         )}
       </div>
 

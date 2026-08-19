@@ -31,6 +31,7 @@ import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-workspace'
 import { startQrLogin, checkQrStatus } from './bridge/wechat/login.js'
 import { loadJson, saveJson, validateAccountId } from './bridge/store.js'
+import type { NotifyStatus } from './bridge/notify.js'
 
 export const name = '@lanbaolu/dsh-wechat-bridge'
 
@@ -1060,6 +1061,16 @@ export function apply(ctx: Context, config: Config): void {
       },
     }))
 
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/notify/status',
+      handler: async (_req, res) => {
+        const result = await queryNotifyStatus()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(result))
+      },
+    }))
+
     for (const action of ['start', 'stop', 'restart'] as const) {
       disposers.push(webServer.register({
         kind: 'exact',
@@ -1165,6 +1176,84 @@ export function apply(ctx: Context, config: Config): void {
   // -------------------------------------------------------------------------
   // Model-facing tools
   // -------------------------------------------------------------------------
+
+  /**
+   * Query the daemon's proactive-notification throttle status (for the panel).
+   */
+  async function queryNotifyStatus(): Promise<{ ok: boolean; data?: NotifyStatus; error?: string }> {
+    const portPath = join(dataDir, 'daemon-port.json')
+    let info: { port?: number; token?: string } | null = null
+    try {
+      info = JSON.parse(readFileSync(portPath, 'utf8')) as { port?: number; token?: string }
+    } catch {
+      return { ok: false, error: '守护进程未运行（缺少 daemon-port.json）' }
+    }
+    if (!info?.port || !info?.token) {
+      return { ok: false, error: '守护进程信息不完整' }
+    }
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 5000)
+      const resp = await fetch(`http://127.0.0.1:${info.port}/notify/status`, {
+        headers: { 'x-dsh-bridge-token': info.token },
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+      if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` }
+      const data = (await resp.json()) as NotifyStatus
+      return { ok: true, data }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  }
+
+  /**
+   * Deliver a proactive notification to the bound WeChat account via the
+   * daemon's throttled notify endpoint (daemon-port.json).
+   */
+  async function sendWechatNotify(message: string): Promise<{ ok: boolean; message: string }> {
+    const portPath = join(dataDir, 'daemon-port.json')
+    let info: { port?: number; token?: string } | null = null
+    try {
+      info = JSON.parse(readFileSync(portPath, 'utf8')) as { port?: number; token?: string }
+    } catch {
+      return { ok: false, message: '守护进程未运行或尚未就绪（缺少 daemon-port.json）。请先执行 wechat_bridge_start 启动守护进程。' }
+    }
+    if (!info?.port || !info?.token) {
+      return { ok: false, message: '守护进程信息不完整，请重启守护进程后重试。' }
+    }
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 10_000)
+      const resp = await fetch(`http://127.0.0.1:${info.port}/notify`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-dsh-bridge-token': info.token,
+        },
+        body: JSON.stringify({ message }),
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+      const data = (await resp.json().catch(() => ({}))) as {
+        accepted?: boolean
+        reason?: string
+        delaySec?: number
+        queued?: number
+        error?: string
+      }
+      if (resp.ok && data.accepted) {
+        const parts = ['已投递到微信通知队列。']
+        if (data.delaySec) parts.push(`预计 ${data.delaySec}s 后发送。`)
+        if (data.reason === 'queue-full') parts.push('（通知队列已满，丢弃了一条最旧的通知）')
+        if (data.queued && data.queued > 1) parts.push(`当前排队 ${data.queued} 条。`)
+        return { ok: true, message: parts.join('') }
+      }
+      return { ok: false, message: `通知被拒绝：${data.error || data.reason || '未知原因'}` }
+    } catch (err) {
+      return { ok: false, message: `无法连接守护进程：${err instanceof Error ? err.message : String(err)}` }
+    }
+  }
 
   function registerTools(): void {
     const simpleOutput = {
@@ -1336,6 +1425,20 @@ export function apply(ctx: Context, config: Config): void {
         ok: true,
         command: `node "${bridgeScript()}" setup`,
       }),
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'wechat_notify',
+      description: '主动向绑定微信发送一条通知消息。适用于需要主动告知用户的场景：任务完成、任务失败、需要用户确认或决策、长时间任务结束等。注意：为规避微信风控，主动通知有节流限制（每小时 ≤6 条、每日 ≤50 条，超限自动排队延迟发送），请仅在用户真正需要被通知时调用，不要高频调用，措辞避免完全相同的模板化重复。',
+      parameters: {
+        message: { type: 'string', description: '要发送给微信的通知内容，简洁明确，避免模板化重复措辞。' },
+      },
+      output: simpleOutput,
+      execute: async (args: { message: string }) => {
+        const result = await sendWechatNotify(args.message)
+        if (!result.ok) throw new Error(result.message)
+        return { ok: true, message: result.message }
+      },
     }))
   }
 
