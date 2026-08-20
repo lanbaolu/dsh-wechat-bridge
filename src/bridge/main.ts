@@ -346,6 +346,11 @@ async function runDaemon(): Promise<void> {
 
   function handlePriorityCommand(msg: WeixinMessage): boolean {
     if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
+    // Priority commands are destructive (cancel in-flight turn / clear session).
+    // Fail-closed sender check: only the bound account owner may trigger them,
+    // otherwise any contact could stop or wipe someone's running work.
+    const ownerId = account?.userId;
+    if (!ownerId || msg.from_user_id !== ownerId) return false;
     const text = extractTextFromItems(msg.item_list);
     if (!/^\/(?:stop|clear|new)(?:\s|$)/i.test(text)) return false;
     if (session.state !== 'processing') return false;
@@ -417,7 +422,9 @@ async function handleMessage(
 ): Promise<void> {
   if (msg.message_type !== MessageType.USER) return;
   if (!msg.from_user_id || !msg.item_list) return;
-  if (account.userId && msg.from_user_id !== account.userId) return;
+  // Fail-closed: with no known owner we accept nobody. login.ts guarantees a
+  // real userId on save, but an empty/legacy field must deny, not allow-all.
+  if (!account.userId || msg.from_user_id !== account.userId) return;
 
   const contextToken = msg.context_token ?? '';
   const fromUserId = msg.from_user_id;
