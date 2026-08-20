@@ -30,11 +30,15 @@
   "homepage": "https://github.com/lanbaolu/dsh-wechat-bridge",
   "keywords": [
     "dsh",
+    "dsh-plugin",
     "deepseek-harness",
     "wechat",
     "wechat-bridge",
-    "plugin",
-    "chatbot"
+    "iLink",
+    "im-bridge",
+    "chatbot",
+    "notify",
+    "remote"
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
