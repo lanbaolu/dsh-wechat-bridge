@@ -15,6 +15,7 @@ import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem,
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
 import { loadConfig, saveConfig } from './config.js';
+import { loadJson, saveJson } from './store.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
@@ -63,6 +64,100 @@ function updateContextToken(token: string): void {
   } catch (err) {
     logger.warn('Failed to persist context token', { error: err instanceof Error ? err.message : String(err) });
   }
+}
+
+// ---------------------------------------------------------------------------
+// 崩溃安全：跨进程轮询锁 + 入站去重
+// ---------------------------------------------------------------------------
+
+/**
+ * 跨进程轮询锁：同一时刻只允许一个 daemon 轮询微信账号（getupdates 游标
+ * 双写会互相吞消息、双写会话日志）。pid 存活 + 90s 心跳判断，陈旧锁自动
+ * 接管（宿主看门狗重启 / 上次崩溃残留都不会卡死）。
+ */
+const POLL_LOCK_PATH = join(DATA_DIR, 'poll.lock');
+
+function readPollLock(): { pid?: number; heartbeat?: number } | null {
+  try {
+    return JSON.parse(readFileSync(POLL_LOCK_PATH, 'utf8')) as { pid?: number; heartbeat?: number };
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writePollLock(): void {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(POLL_LOCK_PATH, JSON.stringify({ pid: process.pid, heartbeat: Date.now() }) + '\n', 'utf8');
+  } catch (err) {
+    logger.warn('Failed to write poll lock', { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+function acquirePollLock(): boolean {
+  const existing = readPollLock();
+  if (existing && typeof existing.pid === 'number' && existing.pid !== process.pid
+      && isPidAlive(existing.pid)
+      && typeof existing.heartbeat === 'number'
+      && existing.heartbeat > Date.now() - 90_000) {
+    return false;
+  }
+  writePollLock();
+  return true;
+}
+
+/**
+ * 入站去重：崩溃重投 / 轮询重叠窗口里 getupdates 可能重放已处理消息，
+ * 按 message_id（缺省回退 seq）直接跳过。最近条目持久化，重启后仍生效。
+ */
+const DEDUP_PATH = join(DATA_DIR, 'dedup.json');
+const DEDUP_TTL_MS = 60 * 60 * 1000;
+const seenMessages = new Map<string, number>();
+let dedupSaveTimer: ReturnType<typeof setTimeout> | undefined;
+
+function loadDedup(): void {
+  const parsed = loadJson<{ entries?: Record<string, number> }>(DEDUP_PATH, { entries: {} });
+  const cutoff = Date.now() - DEDUP_TTL_MS;
+  for (const [key, ts] of Object.entries(parsed.entries ?? {})) {
+    if (typeof ts === 'number' && ts > cutoff) seenMessages.set(key, ts);
+  }
+}
+
+/** 返回 true = 首次见到（应处理）；false = 重复（应跳过）。 */
+function markSeen(key: string): boolean {
+  if (seenMessages.has(key)) return false;
+  seenMessages.set(key, Date.now());
+  if (seenMessages.size > 1000) {
+    const cutoff = Date.now() - DEDUP_TTL_MS;
+    for (const [k, ts] of seenMessages) {
+      if (ts < cutoff) seenMessages.delete(k);
+    }
+  }
+  return true;
+}
+
+function scheduleDedupSave(): void {
+  if (dedupSaveTimer) return;
+  dedupSaveTimer = setTimeout(() => {
+    dedupSaveTimer = undefined;
+    try {
+      const entries: Record<string, number> = {};
+      for (const [k, ts] of seenMessages) entries[k] = ts;
+      saveJson(DEDUP_PATH, { entries });
+    } catch {
+      // 去重表丢失只影响崩溃重投场景，不阻塞消息处理
+    }
+  }, 1000);
+  dedupSaveTimer.unref?.();
 }
 
 /** Extensions eligible for auto-push when detected in DSH's response text. */
@@ -323,6 +418,7 @@ async function runDaemon(): Promise<void> {
   const sender = createSender(api, account.accountId);
   lastActiveUserId = account.userId || '';
   loadContextToken();
+  loadDedup();
 
   // -------------------------------------------------------------------------
   // Proactive notification endpoint (DSH → daemon), throttled.
@@ -476,6 +572,17 @@ async function runDaemon(): Promise<void> {
 
   const callbacks: MonitorCallbacks = {
     onMessage: async (msg: WeixinMessage) => {
+      // 崩溃安全：重复投递（崩溃重投 / 轮询重叠）直接跳过。
+      const dedupKey = msg.message_id !== undefined && msg.message_id !== null
+        ? `id:${String(msg.message_id)}`
+        : (msg as { seq?: unknown }).seq !== undefined ? `seq:${String((msg as { seq?: unknown }).seq)}` : '';
+      if (dedupKey) {
+        if (!markSeen(dedupKey)) {
+          logger.debug('Duplicate inbound message skipped', { dedupKey });
+          return;
+        }
+        scheduleDedupSave();
+      }
       // 绑定用户的每条入站消息都刷新 context_token（主动推送的通行证）。
       if (msg.context_token && msg.from_user_id && msg.from_user_id === account?.userId) {
         updateContextToken(msg.context_token);
@@ -491,6 +598,14 @@ async function runDaemon(): Promise<void> {
     },
   };
 
+  // 崩溃安全：拒绝第二个活着的 daemon 同时轮询（游标双写会互相吞消息）。
+  if (!acquirePollLock()) {
+    console.error('⚠️ 另一个桥接守护进程正在轮询本账号，本进程退出。若确无其他实例运行，删除 ~/.dsh/wechat-bridge/poll.lock 后重试。');
+    process.exit(1);
+  }
+  const lockTimer = setInterval(writePollLock, 30_000);
+  lockTimer.unref?.();
+
   const monitor = createMonitor(api, callbacks);
 
   function shutdown(): void {
@@ -498,6 +613,11 @@ async function runDaemon(): Promise<void> {
     monitor.stop();
     notifyServer.close();
     notifyThrottle.stop();
+    clearInterval(lockTimer);
+    try {
+      const lock = readPollLock();
+      if (lock?.pid === process.pid) unlinkSync(POLL_LOCK_PATH);
+    } catch { /* ignore */ }
     try { unlinkSync(notifyPortPath); } catch { /* ignore */ }
     process.exit(0);
   }
@@ -671,6 +791,7 @@ async function sendToDsh(
     let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
     let pendingSend = '';
     let lastSentTime = Date.now();
+    let turnUsage: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number } | undefined;
 
     // 流式攒批策略：攒够字数或流停顿时才发送，避免碎片消息刷屏：
     //  - 缓冲 ≥ 1200 字：立即按自然边界切出一段发送（见 chunk 分支）；
@@ -745,13 +866,25 @@ async function sendToDsh(
           }
           break;
         case 'done':
-          // Wait for the next stream tick to flush the remaining buffer.
+          // 流结束：记录本轮用量（供尾注），剩余缓冲由下方 flush 兜底。
+          if (event.usage) turnUsage = event.usage;
           break;
       }
     }, controller.signal);
 
     if (flushTimer) clearInterval(flushTimer);
     if (keepaliveTimer) clearInterval(keepaliveTimer);
+
+    // 上下文用量尾注：inputTokens + cacheReadTokens ≈ 当前上下文大小。
+    // 并入最后一段缓冲一起发，不额外产生消息（config.json 可关：usageFooter=false）。
+    if (config.usageFooter !== false && turnUsage) {
+      const ctxK = Math.round(((turnUsage.inputTokens ?? 0) + (turnUsage.cacheReadTokens ?? 0)) / 100) / 10;
+      const out = turnUsage.outputTokens ?? 0;
+      if (ctxK > 0) {
+        pendingSend += `\n\n🧮 上下文约 ${ctxK}k tokens · 本轮输出 ${out}`;
+      }
+    }
+
     await flush();
 
     const resultText = finalText.trim();

@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync, mkdirSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 import { logger } from "./logger.js";
 
@@ -19,7 +19,14 @@ export function loadJson<T>(filePath: string, fallback: T): T {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
-      logger.warn('loadJson failed, using fallback', { filePath, error: err instanceof Error ? err.message : String(err) });
+      // 崩溃安全：损坏文件改名隔离留证再回退默认值，绝不静默吞掉状态，
+      // 也绝不让一个坏文件反复阻塞后续加载。
+      try {
+        renameSync(filePath, `${filePath}.corrupt-${Date.now()}`);
+        logger.warn('loadJson quarantined corrupt file, using fallback', { filePath, error: err instanceof Error ? err.message : String(err) });
+      } catch {
+        logger.warn('loadJson failed (quarantine rename failed), using fallback', { filePath, error: err instanceof Error ? err.message : String(err) });
+      }
     }
     return fallback;
   }

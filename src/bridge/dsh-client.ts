@@ -16,12 +16,20 @@ export interface DshPromptInput {
   files?: string[];
 }
 
+export interface DshStreamUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  reasoningTokens?: number;
+}
+
 export interface DshStreamEvent {
   type: 'chunk' | 'done' | 'error' | 'status';
   text?: string;
   sessionId?: string;
   message?: string;
   turn?: number;
+  usage?: DshStreamUsage;
 }
 
 export interface DshProjectSession {

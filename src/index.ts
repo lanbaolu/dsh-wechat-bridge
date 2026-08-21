@@ -73,12 +73,21 @@ export const Config = z.object({
   approvalTimeoutSec: z.number().min(10).max(3600).default(300),
 })
 
+interface StreamUsage {
+  inputTokens?: number
+  outputTokens?: number
+  cacheReadTokens?: number
+  reasoningTokens?: number
+}
+
 interface StreamEvent {
   type: 'chunk' | 'done' | 'error' | 'status'
   text?: string
   sessionId?: string
   message?: string
   turn?: number
+  /** 本轮最后一步的 LLM 用量（turn/end 时随 done 下发，供微信端尾注展示）。 */
+  usage?: StreamUsage
 }
 
 interface WebRouteLike {
@@ -649,6 +658,9 @@ export function apply(ctx: Context, config: Config): void {
     streamClients.delete(sessionId)
   }
 
+    // 每账号最近一次 LLM 用量：inputTokens + cacheReadTokens ≈ 当前上下文大小。
+    const lastUsage = new Map<string, StreamUsage>()
+
   // Subscribe to every session event and forward assistant chunks to the
   // bridge daemon. Only sessions created by this plugin are forwarded.
   ctx.on('session/event', (session: { id: unknown }, event: SessionEvent) => {
@@ -658,13 +670,15 @@ export function apply(ctx: Context, config: Config): void {
     if (!accountId) return
 
     if (event.type === 'assistant/chunk') {
-      const chunk = event.data.chunk as { type?: string; text?: string } | undefined
+      const chunk = event.data.chunk as { type?: string; text?: string; usage?: StreamUsage } | undefined
       if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
         broadcast(accountId, { type: 'chunk', text: chunk.text })
-      }
-    } else if (event.type === 'turn/end') {
+        } else if (chunk?.type === 'usage' && chunk.usage) {
+          lastUsage.set(accountId, chunk.usage)
+        }
+      } else if (event.type === 'turn/end') {
       debugLog('session turn/end', { accountId, sessionId: sid, reason: event.data.reason })
-      broadcast(accountId, { type: 'done', turn: event.data.turn, message: 'turn ended' })
+      broadcast(accountId, { type: 'done', turn: event.data.turn, message: 'turn ended', usage: lastUsage.get(accountId) })
       if (pendingProjectSwitches.has(accountId)) {
         pendingProjectSwitches.delete(accountId)
         void disposeAgent(accountId, { preserveSelection: true }).catch((err) => {
