@@ -38,9 +38,34 @@ export interface WechatAgentSetupDeps {
   log?: (message: string, data?: unknown) => void
 }
 
+interface AgentPresetsLike {
+  mount?: (agentCtx: Context, id?: string) => Promise<{ id?: string } | unknown>
+}
+
 export function createWechatAgentSetup(deps: WechatAgentSetupDeps): AgentSetup {
   const log = deps.log ?? (() => {})
-  return (agentCtx: Context) => {
+  return async (agentCtx: Context) => {
+    // 必须挂载部署默认 preset：不挂的话工具/技能/提示词全部退化到空全局层
+    // （dsh-agent-presets 会告警 "published without joining an agent preset"），
+    // shell 等 preset 提供的工具拿不到，审批流也无从触发。
+    try {
+      const presets = agentCtx.get('agentPresets') as AgentPresetsLike | undefined
+      if (presets?.mount) {
+        const mounted = await presets.mount(agentCtx)
+        log('agent preset mounted', {
+          accountId: deps.accountId,
+          preset: (mounted as { id?: string } | undefined)?.id,
+        })
+      } else {
+        log('agentPresets service unavailable, agent stays on global layer', { accountId: deps.accountId })
+      }
+    } catch (err) {
+      log('agent preset mount failed (agent falls back to global layer)', {
+        accountId: deps.accountId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+
     try {
       const systemPrompt = agentCtx.get('systemPrompt') as SystemPromptLike | undefined
       systemPrompt?.section?.({ name: WECHAT_CHANNEL_SECTION, order: 150, text: WECHAT_CHANNEL_PROMPT })

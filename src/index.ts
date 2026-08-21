@@ -38,7 +38,7 @@ import type { NotifyStatus } from './bridge/notify.js'
 export const name = '@lanbaolu/dsh-wechat-bridge'
 
 /** Host services the plugin needs. `webServer` is optional (headless profiles). */
-export const inject = ['tools', 'agents', 'agentDefaultModel']
+export const inject = ['tools', 'agents', 'agentDefaultModel', 'agentPresets']
 
 export interface Config {
   /** Data directory for accounts/sessions/logs. */
