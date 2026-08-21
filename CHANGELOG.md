@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1] - 2026-08-21
+
+### Fixed
+
+- **微信 agent 挂载部署 preset**：程序化创建的 agent 不挂 preset 时工具/技能/提示词全部退化到空全局层（实测微信 agent 拿不到 shell）。现于 setup 钩子中 `AgentPresets.mount()` 挂部署默认 preset（router-standard），shell/技能恢复可用，inject 声明补 `agentPresets`。
+- **Web 面板路由注册**：webServer fiber 晚于插件装配时 `ctx.get('webServer')` 静默拿到 undefined，11 条面板路由全部丢失、面板退化为 SPA 空壳（Safari 报 "The string did not match the expected pattern."）。改用 `ctx.inject(['webServer'])` 在服务激活后注册，headless 环境不受影响。
+
 ## [0.4.0] - 2026-08-21
 
 ### Added
