@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] - 2026-08-21
+
+### Added
+
+- **微信内审批**：agent 请求权限时自动推送审批消息到绑定微信，回复 `/yes` 批准、`/no` 拒绝；默认 5 分钟超时自动拒绝（fail-closed，可用 `approvalTimeoutSec` 调整；`approvalViaWechat=false` 可完全交回桌面 GUI）。基于 DSH 内核 `approval/request` 瀑布事件的 scoped 应答器实现，只作用于微信桥自己的 agent，不影响桌面会话。
+- 守护进程新增内部 `POST /approval` 端点（127.0.0.1 + token 鉴权）：审批消息绕过节流直发（阻塞交互不能等通知队列的 60s 最小间隔）。
+- `/yes` `/no` 与 `/stop` 同级：抢在消息队列之前处理，避免任务挂起时审批回复被排队到死锁；发送者校验 fail-closed，仅绑定账号本人可裁决。
+- **防卡死**：微信桥 agent 创建/恢复时通过 `setup` 钩子注入 scoped 提示词段落，明确禁止模型使用 `ask_user_question` 等交互式选项工具（选项只弹在电脑浏览器，微信用户看不到会永久阻塞），引导模型改用纯文本编号选项。
+
+### Fixed
+
+- 修复主动推送通道：iLink 主动发消息（bot → 用户）必须回传最近一次入站消息的 `context_token`，空 token 被服务端拒绝（`ret:-2 "prepare failed"`，实测）。现每条入站消息刷新并持久化 `context-token.json`（重启不丢），主动通知与审批推送共用。此缺陷同时影响 0.3.0 的 `wechat_notify`，一并修复。
+
+### Security
+
+- 审批裁决严格归属：`/yes` `/no` 只裁决本账号自己 agent 的 pending 请求；同一账号同时只允许一条待审批，并发新请求自动交回瀑布下游；请求被撤销（如 `/stop`）时立即收敛为 cancelled，迟到回复不再生效。
+
 ## [0.3.1] - 2026-08-20
 
 ### Fixed
