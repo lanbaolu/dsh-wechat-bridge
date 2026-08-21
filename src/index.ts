@@ -1078,12 +1078,26 @@ export function apply(ctx: Context, config: Config): void {
   // Optional Web panel routes (same origin, no token)
   // -------------------------------------------------------------------------
 
-  function registerWebRoutes(): (() => void)[] {
-    const webServer = ctx.get('webServer') as
-      | { register(route: WebRouteLike): () => void }
-      | undefined
-    if (!webServer) return []
+  function registerWebRoutes(): void {
+    // webServer 的 fiber 可能晚于本插件装配：ctx.get 会静默拿不到（面板路由
+    // 全部丢失，面板退化为 SPA 空壳）。ctx.inject 等 webServer 激活后再注册；
+    // headless profile 没有 webServer 时回调不会执行——面板不可用但不影响核心桥接。
+    ctx.inject(['webServer'], (webCtx: Context) => {
+      webCtx.effect(() => {
+        const webServer = webCtx.get('webServer') as
+          | { register(route: WebRouteLike): () => void }
+          | undefined
+        if (!webServer) return () => {}
+        const disposers = registerRoutesInto(webServer)
+        debugLog('web panel routes registered', { count: disposers.length })
+        return () => {
+          for (const dispose of disposers) dispose()
+        }
+      })
+    })
+  }
 
+  function registerRoutesInto(webServer: { register(route: WebRouteLike): () => void }): (() => void)[] {
     const disposers: (() => void)[] = []
 
     disposers.push(webServer.register({
@@ -1552,7 +1566,7 @@ export function apply(ctx: Context, config: Config): void {
     internalServer = server
 
     registerTools()
-    const webDisposers = registerWebRoutes()
+    registerWebRoutes()
 
     // Watchdog: after sleep/wake or an unexpected daemon exit, automatically
     // bring the bridge back instead of requiring the user to click Start.
@@ -1571,7 +1585,6 @@ export function apply(ctx: Context, config: Config): void {
 
     return () => {
       if (healthTimer) clearInterval(healthTimer)
-      for (const dispose of webDisposers) dispose()
       for (const handle of agents.values()) {
         void handle.dispose()
       }
