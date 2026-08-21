@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0] - 2026-08-21
+
+### Added
+
+- **上下文用量尾注**：每轮回复末尾附 `🧮 上下文约 N k tokens · 本轮输出 M`（inputTokens+cacheReadTokens ≈ 当前上下文大小），并入最后一段缓冲不额外产生消息；`config.json` 设 `usageFooter=false` 可关。
+- **媒体能力矩阵**（README）：方向×类型实测表，如实标注未支持项（入站视频仅占位、出站视频未支持）。
+
+### Security / Reliability（崩溃安全加固）
+
+- **跨进程轮询锁**（`poll.lock`，pid 存活 + 90s 心跳，陈旧锁自动接管）：拒绝第二个活着的 daemon 同时轮询——游标双写会互相吞消息、双写会话日志。
+- **入站去重**：按 message_id（缺省回退 seq）跳过重复投递，最近条目持久化 `dedup.json`（TTL 1h），崩溃重投/轮询重叠不再重复驱动 agent。
+- **损坏文件隔离**：loadJson 解析失败时改名 `.corrupt-<ts>` 留证再回退默认值，不再静默吞掉状态，坏文件不会反复阻塞加载。
+
 ## [0.4.1] - 2026-08-21
 
 ### Fixed
