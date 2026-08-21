@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { join, basename, extname } from 'node:path';
-import { unlinkSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { unlinkSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 import { WeChatApi } from './wechat/api.js';
@@ -33,6 +33,37 @@ const MAX_MESSAGE_LENGTH = 4000;
  * Fallback target for proactive notifications when account.userId is empty.
  */
 let lastActiveUserId = '';
+
+/**
+ * iLink 主动发消息（bot → 用户）必须回传最近一次入站消息携带的
+ * context_token，空 token 会被服务端拒绝（ret:-2 "prepare failed"）。
+ * 每次收到绑定用户的消息就刷新并持久化它，供主动通知 / 审批推送使用。
+ */
+let lastContextToken = '';
+
+function contextTokenPath(): string {
+  return join(DATA_DIR, 'context-token.json');
+}
+
+function loadContextToken(): void {
+  try {
+    const parsed = JSON.parse(readFileSync(contextTokenPath(), 'utf8')) as { token?: unknown };
+    lastContextToken = typeof parsed.token === 'string' ? parsed.token : '';
+  } catch {
+    lastContextToken = '';
+  }
+}
+
+function updateContextToken(token: string): void {
+  if (!token || token === lastContextToken) return;
+  lastContextToken = token;
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(contextTokenPath(), JSON.stringify({ token, updatedAt: Date.now() }) + '\n', 'utf8');
+  } catch (err) {
+    logger.warn('Failed to persist context token', { error: err instanceof Error ? err.message : String(err) });
+  }
+}
 
 /** Extensions eligible for auto-push when detected in DSH's response text. */
 const AUTO_PUSH_EXTENSIONS = new Set([
@@ -107,6 +138,19 @@ function splitByNewline(text: string, maxLen: number): string[] {
 }
 
 /** Split a message into WeChat-safe chunks, preserving paragraphs. */
+/**
+ * 从流式缓冲头部切出一段待发文本：优先在换行边界截断（≤ maxChars，不切词）；
+ * 找不到合适边界时按 maxChars 硬切（罕见，长串无换行文本）。返回 [切出部分, 剩余]。
+ */
+function takeBatch(buffer: string, maxChars: number): [string, string] {
+  if (buffer.length <= maxChars) return [buffer, ''];
+  const windowText = buffer.slice(0, maxChars);
+  const cut = windowText.lastIndexOf('\n');
+  // 边界太靠前（不足一半）就放弃边界硬切，避免切出过短碎片。
+  if (cut >= maxChars / 2) return [windowText.slice(0, cut), buffer.slice(cut + 1)];
+  return [windowText, buffer.slice(maxChars)];
+}
+
 function splitMessage(text: string, maxLen: number = MAX_MESSAGE_LENGTH): string[] {
   if (text.length <= maxLen) return [text];
   const blocks = parseBlocks(text);
@@ -278,6 +322,7 @@ async function runDaemon(): Promise<void> {
 
   const sender = createSender(api, account.accountId);
   lastActiveUserId = account.userId || '';
+  loadContextToken();
 
   // -------------------------------------------------------------------------
   // Proactive notification endpoint (DSH → daemon), throttled.
@@ -285,7 +330,7 @@ async function runDaemon(): Promise<void> {
   // so notifications go through a queue + rate limits (see notify.ts).
   // -------------------------------------------------------------------------
   const notifyThrottle = createNotifyThrottle((message) =>
-    sender.sendText(lastActiveUserId, '', message));
+    sender.sendText(lastActiveUserId, lastContextToken, message));
   const notifyPortPath = join(DATA_DIR, 'daemon-port.json');
   const notifyServer = createServer((req, res) => {
     const token = process.env.DSH_BRIDGE_API_TOKEN;
@@ -299,7 +344,9 @@ async function runDaemon(): Promise<void> {
       res.end(JSON.stringify(notifyThrottle.getStatus()));
       return;
     }
-    if (req.method !== 'POST' || (req.url !== '/notify' && req.url !== '/notify/')) {
+    const isNotify = req.url === '/notify' || req.url === '/notify/';
+    const isApproval = req.url === '/approval' || req.url === '/approval/';
+    if (req.method !== 'POST' || (!isNotify && !isApproval)) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'not found' }));
       return;
@@ -312,7 +359,27 @@ async function runDaemon(): Promise<void> {
     req.on('end', () => {
       try {
         const parsed = JSON.parse(body) as { message?: unknown };
-        const result = notifyThrottle.enqueue(String(parsed?.message ?? ''));
+        const message = String(parsed?.message ?? '');
+        // 审批是阻塞交互且量极低（由用户自己的任务触发），绕过节流直发，
+        // 否则 60s 的最小通知间隔会把审批拖到超时。
+        if (isApproval) {
+          if (!message.trim()) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'empty message' }));
+            return;
+          }
+          sender.sendText(lastActiveUserId, lastContextToken, message)
+            .then(() => {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true }));
+            })
+            .catch((err: unknown) => {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+            });
+          return;
+        }
+        const result = notifyThrottle.enqueue(message);
         res.writeHead(result.accepted ? 200 : 400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch {
@@ -374,9 +441,47 @@ async function runDaemon(): Promise<void> {
     return true;
   }
 
+  /**
+   * 审批回复是时间敏感的交互（host 侧的 agent 正挂着等裁决），必须像
+   * /stop 一样抢在消息队列之前处理——否则排队到任务结束就死锁到超时。
+   * 同样 fail-closed：只认绑定账号本人的 /yes /no。
+   */
+  async function handleApprovalReply(msg: WeixinMessage): Promise<boolean> {
+    if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
+    const ownerId = account?.userId;
+    if (!ownerId || msg.from_user_id !== ownerId) return false;
+    const text = extractTextFromItems(msg.item_list).trim();
+    const match = /^\/(yes|no)(?:\s|$)/i.exec(text);
+    if (!match) return false;
+    const approved = match[1].toLowerCase() === 'yes';
+
+    let reply: string;
+    try {
+      const result = await client.decideApproval(account!.accountId, approved);
+      if (result.ok) {
+        reply = approved
+          ? `✅ 已批准${result.toolName ? `：${result.toolName}` : ''}，任务继续执行。`
+          : `🚫 已拒绝${result.toolName ? `：${result.toolName}` : ''}。`;
+      } else if (result.reason === 'disabled') {
+        reply = 'ℹ️ 微信审批未启用，请在电脑端处理该请求。';
+      } else {
+        reply = '当前没有待审批的请求（可能已超时自动拒绝）。';
+      }
+    } catch {
+      reply = '⚠️ 审批结果未能送达 DSH，请到电脑端确认任务状态。';
+    }
+    await sender.sendText(ownerId, msg.context_token ?? '', reply).catch(() => {});
+    return true;
+  }
+
   const callbacks: MonitorCallbacks = {
     onMessage: async (msg: WeixinMessage) => {
+      // 绑定用户的每条入站消息都刷新 context_token（主动推送的通行证）。
+      if (msg.context_token && msg.from_user_id && msg.from_user_id === account?.userId) {
+        updateContextToken(msg.context_token);
+      }
       if (handlePriorityCommand(msg)) return;
+      if (await handleApprovalReply(msg)) return;
       messageQueue.push(msg);
       drainQueue();
     },
@@ -567,10 +672,25 @@ async function sendToDsh(
     let pendingSend = '';
     let lastSentTime = Date.now();
 
-    const flush = async (force: boolean): Promise<void> => {
+    // 流式攒批策略：攒够字数或流停顿时才发送，避免碎片消息刷屏：
+    //  - 缓冲 ≥ 1200 字：立即按自然边界切出一段发送（见 chunk 分支）；
+    //  - 缓冲 ≥ 600 字：定时器补一刀发掉；
+    //  - 流停顿超过 2.5s（生成间隙）：把尾巴发出去，别让用户干等；
+    //  - 其余情况继续攒——宁可少发几条整的，也不要把一句话切成三段。
+    const BATCH_TICK_MS = 800;
+    const BATCH_MIN_CHARS = 600;
+    const STREAM_STALL_MS = 2500;
+    let lastChunkTime = Date.now();
+
+    const flush = async (maxChars?: number): Promise<void> => {
       if (!pendingSend) return;
-      const text = pendingSend;
-      pendingSend = '';
+      let text: string;
+      if (maxChars !== undefined) {
+        [text, pendingSend] = takeBatch(pendingSend, maxChars);
+      } else {
+        text = pendingSend;
+        pendingSend = '';
+      }
       for (const chunk of splitMessage(text)) {
         try {
           await sender.sendText(fromUserId, contextToken, chunk);
@@ -586,8 +706,11 @@ async function sendToDsh(
     };
 
     flushTimer = setInterval(() => {
-      void flush(true).catch(() => {});
-    }, 1500);
+      if (!pendingSend) return;
+      if (pendingSend.length >= BATCH_MIN_CHARS || Date.now() - lastChunkTime > STREAM_STALL_MS) {
+        void flush().catch(() => {});
+      }
+    }, BATCH_TICK_MS);
 
     // 超时安抚：如果 5 分钟没有产出任何消息，主动告诉用户还在处理。
     const SILENCE_WARNING_MS = 5 * 60 * 1000;
@@ -606,10 +729,10 @@ async function sendToDsh(
           if (event.text) {
             finalText += event.text;
             pendingSend += event.text;
-            // Batch streaming chunks into reasonably-sized WeChat messages;
-            // flush immediately per-chunk would spam hundreds of tiny messages.
+            lastChunkTime = Date.now();
+            // 缓冲攒大后按自然边界切出一段先发（不切词），剩余的继续攒。
             if (pendingSend.length >= 1200) {
-              void flush(false).catch(() => {});
+              void flush(1200).catch(() => {});
             }
           }
           break;
@@ -629,7 +752,7 @@ async function sendToDsh(
 
     if (flushTimer) clearInterval(flushTimer);
     if (keepaliveTimer) clearInterval(keepaliveTimer);
-    await flush(true);
+    await flush();
 
     const resultText = finalText.trim();
     if (resultText) {
