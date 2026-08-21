@@ -23,6 +23,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
+import { createApprovalManager } from './approval.js'
+import { createWechatAgentSetup } from './agent-setup.js'
 
 // Pull in Context augmentation for agents/session/default-model/workspace events.
 import type {} from '@deepseek-ai/dsh-agent'
@@ -53,6 +55,10 @@ export interface Config {
   model: string
   /** Default workspace for the DSH agent created per WeChat account. */
   workingDirectory: string
+  /** Bridge approval requests to WeChat (/yes /no); false = leave them to the desktop GUI. */
+  approvalViaWechat: boolean
+  /** Seconds before a WeChat approval request auto-rejects (fail-closed). */
+  approvalTimeoutSec: number
 }
 
 export const Config = z.object({
@@ -63,6 +69,8 @@ export const Config = z.object({
   provider: z.string().default(''),
   model: z.string().default(''),
   workingDirectory: z.string().default(''),
+  approvalViaWechat: z.boolean().default(true),
+  approvalTimeoutSec: z.number().min(10).max(3600).default(300),
 })
 
 interface StreamEvent {
@@ -255,11 +263,18 @@ export function apply(ctx: Context, config: Config): void {
       }
       isSelected = !!selectedSessionId && dshSessionId === selectedSessionId
 
+      const setup = createWechatAgentSetup({
+        accountId,
+        approval: approvalManager,
+        log: debugLog,
+      })
+
       if (dshSessionId) {
         try {
           const candidate = await ctx.agents.resume({
             resumeSessionId: SessionId(dshSessionId),
             agentOptions,
+            setup,
           })
           const persistedCwd = candidate.agent.session.header.cwd
           selectedCwd = persistedCwd || undefined
@@ -303,6 +318,7 @@ export function apply(ctx: Context, config: Config): void {
           sessionId: SessionId(dshSessionId),
           meta: input?.cwd ? { cwd: resolve(input.cwd) } : undefined,
           agentOptions,
+          setup,
         })
       } else {
         debugLog('ensureAgent resume', { accountId, dshSessionId, provider, model, selection, resumed: true, selected: isSelected })
@@ -742,6 +758,24 @@ export function apply(ctx: Context, config: Config): void {
           handle.agent.cancel({ kind: 'user' })
         }
         sendJson(res, 200, { ok: true })
+        return
+      }
+
+      // 微信审批裁决：daemon 转发的 /yes /no。仅裁决本账号自己的 pending，
+      // 无 pending（超时/被撤销/从未推送）时明确返回 no-pending。
+      if (req.method === 'POST' && url.pathname === '/api/approval/decide') {
+        const body = await readBody(req)
+        const sessionId = String(body.sessionId || '')
+        const approved = body.approved === true
+        if (!approvalManager) {
+          sendJson(res, 200, { ok: false, reason: 'disabled' })
+          return
+        }
+        // 未知/非法 accountId 在 decide 里自然落到 no-pending，无需额外校验。
+        const result = sessionId
+          ? approvalManager.decide(sessionId, approved)
+          : { ok: false as const, reason: 'no-pending' as const }
+        sendJson(res, 200, result)
         return
       }
 
@@ -1254,6 +1288,50 @@ export function apply(ctx: Context, config: Config): void {
       return { ok: false, message: `无法连接守护进程：${err instanceof Error ? err.message : String(err)}` }
     }
   }
+
+  /**
+   * Push an urgent approval question to the bound WeChat account via the
+   * daemon's direct (non-throttled) /approval endpoint. Resolves false when
+   * the daemon is unreachable so callers can fall back to other answerers.
+   */
+  async function pushApprovalMessage(message: string): Promise<boolean> {
+    const portPath = join(dataDir, 'daemon-port.json')
+    let info: { port?: number; token?: string } | null = null
+    try {
+      info = JSON.parse(readFileSync(portPath, 'utf8')) as { port?: number; token?: string }
+    } catch {
+      return false
+    }
+    if (!info?.port || !info?.token) return false
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 10_000)
+      const resp = await fetch(`http://127.0.0.1:${info.port}/approval`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-dsh-bridge-token': info.token,
+        },
+        body: JSON.stringify({ message }),
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+      return resp.ok
+    } catch {
+      return false
+    }
+  }
+
+  // 微信审批应答器：仅当配置启用时创建；daemon 推送失败/超时均 fail-closed。
+  const approvalManager = config.approvalViaWechat
+    ? createApprovalManager({
+        timeoutMs: config.approvalTimeoutSec * 1000,
+        push: pushApprovalMessage,
+        log: debugLog,
+      })
+    : undefined
+  // 插件卸载时撤销所有悬而未决的审批（收敛为 cancelled，不留孤儿定时器）。
+  ctx.effect(() => () => approvalManager?.dispose())
 
   function registerTools(): void {
     const simpleOutput = {

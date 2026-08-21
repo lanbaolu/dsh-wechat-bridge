@@ -12,6 +12,8 @@ const HELP_TEXT = `可用命令：
 会话管理：
   /help             显示帮助
   /stop             停止当前对话并清空排队消息
+  /yes              批准 DSH 的权限请求（审批超时自动拒绝）
+  /no               拒绝 DSH 的权限请求
   /clear            清除当前会话并开启新会话
   /new              开启全新会话（等价 /clear）
   /reset            完全重置（包括工作目录等设置）

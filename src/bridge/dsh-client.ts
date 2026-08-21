@@ -91,6 +91,26 @@ export class DshClient {
     });
   }
 
+  /**
+   * Forward the owner's /yes /no decision to the host plugin's approval manager.
+   * `reason` is 'no-pending' (nothing waiting / timed out) or 'disabled'.
+   */
+  async decideApproval(
+    sessionId: string,
+    approved: boolean,
+  ): Promise<{ ok: boolean; reason?: string; toolName?: string }> {
+    const res = await fetch(`${this.baseUrl}/api/approval/decide`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({ sessionId, approved }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      throw new Error(`approval/decide HTTP ${res.status}`);
+    }
+    return res.json() as Promise<{ ok: boolean; reason?: string; toolName?: string }>;
+  }
+
   async listProjects(): Promise<DshProjectSession[]> {
     const res = await fetch(`${this.baseUrl}/api/projects`, {
       headers: this.headers(),
