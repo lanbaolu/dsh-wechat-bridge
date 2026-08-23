@@ -103,6 +103,37 @@ interface NotifyStatus {
   queueCapacity: number
 }
 
+interface TrustedUser {
+  userId: string
+  addedAt: string
+  by: 'owner' | 'bootstrap' | 'restore'
+  lastSeenAt?: number
+  note?: string
+}
+
+interface TrustInfo {
+  mode: 'owner-only' | 'bootstrap' | 'manual'
+  bootstrapConsumed: boolean
+  owner: string
+  notifyRejected: boolean
+  trusted: TrustedUser[]
+}
+
+const TRUST_MODE_LABELS: Record<TrustInfo['mode'], string> = {
+  'owner-only': '仅本机主人（默认）',
+  bootstrap: '首位陌生人自动入集（一次性）',
+  manual: '仅手动添加的人',
+}
+
+function formatTime(ms?: number): string {
+  if (!ms) return '从未活跃'
+  try {
+    return new Date(ms).toLocaleString('zh-CN')
+  } catch {
+    return '未知'
+  }
+}
+
 export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.Element {
   const [output, setOutput] = useState('加载中…')
   const [error, setError] = useState<string | null>(null)
@@ -121,6 +152,12 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
   const [projectMessage, setProjectMessage] = useState('')
   const [projectError, setProjectError] = useState('')
   const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null)
+  const [trust, setTrust] = useState<TrustInfo | null>(null)
+  const [trustBusy, setTrustBusy] = useState(false)
+  const [trustMessage, setTrustMessage] = useState('')
+  const [trustError, setTrustError] = useState('')
+  const [newTrustId, setNewTrustId] = useState('')
+  const [newTrustNote, setNewTrustNote] = useState('')
 
   const refresh = useCallback(async () => {
     try {
@@ -150,6 +187,18 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+    }
+    // 信任集单独拉取（失败不影响主状态展示）
+    try {
+      const trustRes = await fetch(`${API_BASE}/trust`, { cache: 'no-store' })
+      if (trustRes.ok) {
+        const trustData = await trustRes.json()
+        if (trustData && typeof trustData === 'object' && trustData.ok) {
+          setTrust(trustData as TrustInfo)
+        }
+      }
+    } catch {
+      // ignore
     }
   }, [])
 
@@ -252,6 +301,63 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
     } finally {
       setProjectBusy(false)
     }
+  }
+
+  // ---- 信任集管理（P1-2 / M4）----
+
+  function applyTrustResponse(data: TrustInfo & { ok?: boolean; error?: string }): void {
+    if (data.ok === false) throw new Error(data.error || '操作失败')
+    setTrust({
+      mode: data.mode,
+      bootstrapConsumed: data.bootstrapConsumed,
+      owner: data.owner,
+      notifyRejected: data.notifyRejected,
+      trusted: Array.isArray(data.trusted) ? data.trusted : [],
+    })
+  }
+
+  async function trustRequest(path: string, body: Record<string, unknown>, okMessage: string): Promise<void> {
+    setTrustBusy(true)
+    setTrustError('')
+    setTrustMessage('')
+    try {
+      const res = await fetch(`${API_BASE}/${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || `HTTP ${res.status}`)
+      }
+      applyTrustResponse(data as TrustInfo & { ok?: boolean; error?: string })
+      setTrustMessage(okMessage)
+    } catch (err) {
+      setTrustError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setTrustBusy(false)
+    }
+  }
+
+  async function addTrustedUser(): Promise<void> {
+    const id = newTrustId.trim()
+    if (!id) return
+    await trustRequest('trust/add', { userId: id, note: newTrustNote.trim() || undefined }, `已添加：${id}`)
+    setNewTrustId('')
+    setNewTrustNote('')
+  }
+
+  function removeTrustedUser(userId: string): void {
+    if (!window.confirm(`确认吊销 ${userId}？其后续消息将被拒绝，已有会话历史保留。`)) return
+    void trustRequest('trust/remove', { userId }, `已吊销：${userId}`)
+  }
+
+  function changeTrustMode(mode: TrustInfo['mode']): void {
+    void trustRequest('trust/config', { mode }, `信任模式已切换为：${TRUST_MODE_LABELS[mode]}`)
+  }
+
+  function toggleNotifyRejected(enabled: boolean): void {
+    void trustRequest('trust/config', { notifyRejected: enabled }, enabled ? '已开启陌生人联系提醒' : '已关闭陌生人联系提醒')
   }
 
   useEffect(() => {
@@ -380,6 +486,104 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
           </div>
         ) : (
           <div style={{ fontSize: 12, opacity: 0.7 }}>守护进程未运行，暂无数据。</div>
+        )}
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ ...titleStyle, marginBottom: 4 }}>🔐 信任用户（多用户）</div>
+        {!trust ? (
+          <div style={{ fontSize: 12, opacity: 0.7 }}>加载中…</div>
+        ) : (
+          <>
+            <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 6 }}>
+              信任模式
+              <select
+                value={trust.mode}
+                onChange={(e) => changeTrustMode(e.target.value as TrustInfo['mode'])}
+                disabled={trustBusy}
+                style={{ ...inputStyle, marginLeft: 8, minWidth: 240 }}
+                aria-label="选择信任模式"
+              >
+                <option value="owner-only">{TRUST_MODE_LABELS['owner-only']}</option>
+                <option value="bootstrap">{TRUST_MODE_LABELS.bootstrap}</option>
+                <option value="manual">{TRUST_MODE_LABELS.manual}</option>
+              </select>
+            </div>
+            {trust.mode === 'bootstrap' && trust.bootstrapConsumed && (
+              <div style={{ fontSize: 12, color: '#b7791f', marginBottom: 6 }}>
+                ⚠️ bootstrap 首次名额已用完，后续陌生人不会再自动入集，请用下方表单手动添加或切到 manual。
+              </div>
+            )}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, marginBottom: 8 }}>
+              <input
+                type="checkbox"
+                checked={trust.notifyRejected}
+                disabled={trustBusy}
+                onChange={(e) => toggleNotifyRejected(e.target.checked)}
+              />
+              陌生人尝试联系时向 owner 推送提醒
+            </label>
+            <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
+              owner：{trust.owner || '（未绑定）'} · 信任用户：{trust.trusted.length} 个
+            </div>
+            {trust.trusted.length > 0 && (
+              <div style={{ marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {trust.trusted.map((u) => (
+                  <div
+                    key={u.userId}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      padding: '6px 8px',
+                      background: 'var(--surface-3, rgba(127,127,127,.05))',
+                      border: '1px solid var(--border-color, rgba(127,127,127,.12))',
+                      borderRadius: 6,
+                    }}
+                  >
+                    <span style={{ fontWeight: 600 }}>{u.userId}</span>
+                    {u.note && <span style={{ opacity: 0.7, fontSize: 12 }}>{u.note}</span>}
+                    <span style={{ marginLeft: 'auto', fontSize: 11, opacity: 0.6 }}>
+                      {u.by === 'bootstrap' ? '自动入集' : u.by === 'restore' ? '迁移导入' : '手动添加'} · {formatTime(u.lastSeenAt)}
+                    </span>
+                    <button
+                      type="button"
+                      style={{ ...buttonStyle, color: '#e5484d' }}
+                      disabled={trustBusy}
+                      onClick={() => removeTrustedUser(u.userId)}
+                    >
+                      吊销
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <input
+                type="text"
+                value={newTrustId}
+                onChange={(e) => setNewTrustId(e.target.value)}
+                placeholder="要添加的微信 userId"
+                style={{ ...inputStyle, minWidth: 180 }}
+              />
+              <input
+                type="text"
+                value={newTrustNote}
+                onChange={(e) => setNewTrustNote(e.target.value)}
+                placeholder="备注（可选）"
+                style={{ ...inputStyle, minWidth: 120 }}
+              />
+              <button type="button" style={buttonStyle} disabled={trustBusy || !newTrustId.trim()} onClick={() => void addTrustedUser()}>
+                添加信任
+              </button>
+            </div>
+            {trustMessage && <div role="status" style={{ color: '#2f9e44', marginTop: 6, fontSize: 12 }}>{trustMessage}</div>}
+            {trustError && <div role="alert" style={{ color: '#e5484d', marginTop: 6, fontSize: 12 }}>{trustError}</div>}
+            <div style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
+              信任用户与 owner 各自拥有独立会话、独立上下文，互不可见。撤销信任后其新消息将被拒绝，但已有历史保留。
+              修改信任模式后，新入站消息立即生效，无需重启。
+            </div>
+          </>
         )}
       </div>
 

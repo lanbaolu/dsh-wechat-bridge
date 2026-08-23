@@ -43,6 +43,12 @@ export interface NotifyEnqueueResult {
   queued: number;
 }
 
+interface QueuedNotify {
+  message: string;
+  /** 目标微信用户（P1-2 / M3）；缺省由发送回调自行决定兜底目标。 */
+  userId?: string;
+}
+
 /**
  * 轮换前缀池：不改变语义的符号前缀，打散「完全一致文案重复推送」的模板特征。
  * 空串占比最高，避免每条通知都带符号。
@@ -96,8 +102,8 @@ export interface NotifyStatus {
 }
 
 export interface NotifyThrottle {
-  /** 入队一条主动通知。 */
-  enqueue(message: string): NotifyEnqueueResult;
+  /** 入队一条主动通知（可指定目标用户，缺省回退最近活跃用户）。 */
+  enqueue(message: string, userId?: string): NotifyEnqueueResult;
   /** 当前排队条数。 */
   readonly pendingCount: number;
   /** 当前节流状态快照（供 Web 面板 / 状态工具展示）。 */
@@ -107,14 +113,14 @@ export interface NotifyThrottle {
 }
 
 export function createNotifyThrottle(
-  send: (message: string) => Promise<void>,
+  send: (message: string, userId?: string) => Promise<void>,
   config: NotifyThrottleConfig = DEFAULT_NOTIFY_CONFIG,
 ): NotifyThrottle {
   /** 最近一小时内的发送时间戳（rolling window）。 */
   const hourlyWindow: number[] = [];
   let daily = loadDailyCount();
   let lastSentAt = 0;
-  const queue: string[] = [];
+  const queue: QueuedNotify[] = [];
   let flushing = false;
 
   function now(): number {
@@ -169,13 +175,13 @@ export function createNotifyThrottle(
     recordSent();
   }
 
-  async function sendOne(message: string): Promise<void> {
+  async function sendOne(entry: QueuedNotify): Promise<void> {
     // 随机延迟抖动：打散固定节奏，避免「整点 / 固定间隔」的机器特征。
     await new Promise((resolve) => setTimeout(resolve, randomJitter()));
     try {
-      await send(pickPrefix() + message);
+      await send(pickPrefix() + entry.message, entry.userId);
       markSent();
-      logger.info('Proactive notification sent', { textLength: message.length });
+      logger.info('Proactive notification sent', { textLength: entry.message.length, userId: entry.userId });
     } catch (err) {
       // 发送失败不重试：避免在风控边缘反复试探；下一条按正常节奏走。
       logger.warn('Proactive notification send failed (not retried)', {
@@ -191,8 +197,8 @@ export function createNotifyThrottle(
       // 每次把「当前配额内可发送」的队首依次发出；超限时保留队列等下一个窗口。
       while (queue.length > 0) {
         if (!canSendNow()) break;
-        const message = queue.shift()!;
-        await sendOne(message);
+        const entry = queue.shift()!;
+        await sendOne(entry);
       }
     } finally {
       flushing = false;
@@ -205,22 +211,23 @@ export function createNotifyThrottle(
   timer.unref?.();
 
   return {
-    enqueue(message: string): NotifyEnqueueResult {
+    enqueue(message: string, userId?: string): NotifyEnqueueResult {
       const text = typeof message === 'string' ? message.trim() : '';
       if (!text) return { accepted: false, reason: 'invalid', queued: queue.length };
       const clipped = text.length > MAX_NOTIFY_LENGTH ? text.slice(0, MAX_NOTIFY_LENGTH) : text;
+      const entry: QueuedNotify = userId ? { message: clipped, userId } : { message: clipped };
 
       if (queue.length >= config.queueCapacity) {
         // 队列满：丢弃最旧的（事件通知越新越重要），新通知照常入队。
         queue.shift();
-        queue.push(clipped);
+        queue.push(entry);
         const result: NotifyEnqueueResult = { accepted: true, reason: 'queue-full', queued: queue.length };
         if (!canSendNow()) result.delaySec = 15 + Math.ceil(randomJitter() / 1000);
         void flushLoop().catch(() => {});
         return result;
       }
 
-      queue.push(clipped);
+      queue.push(entry);
       const result: NotifyEnqueueResult = { accepted: true, queued: queue.length };
       if (!canSendNow()) {
         // 受限（窗口/配额/间隔未过）：告诉调用方预计延迟，避免对方以为已发出。

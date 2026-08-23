@@ -2,6 +2,7 @@ import type { CommandContext, CommandResult } from './router.js';
 import type { DshProjectSession } from '../dsh-client.js';
 import { loadConfig, saveConfig } from '../config.js';
 import { DEFAULT_WORKING_DIR } from '../constants.js';
+import { isPlausibleUserId, addTrusted, removeTrusted, listTrusted } from '../trust.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -28,6 +29,12 @@ const HELP_TEXT = `可用命令：
   /cwd [路径]       查看或切换工作目录
   /model [名称]     查看或切换模型
   /prompt [内容]    查看或设置系统提示词（全局生效）
+
+多用户信任（仅 owner 可见）：
+  /trust <userId> [备注]  添加一个信任用户（手动模式生效）
+  /distrust <userId>      吊销一个信任用户
+  /trustlist              查看当前信任集
+  /trustmode [owner-only|bootstrap|manual]  查看或切换信任模式
 
 项目绑定：
   /sessionlist      列出可绑定的 DSH 项目会话
@@ -275,5 +282,122 @@ export function handleUnknown(cmd: string, _args: string): CommandResult {
   return {
     handled: true,
     reply: `未识别命令: /${cmd}\n输入 /help 查看可用命令`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 多用户信任集（P1-2 / M1）
+// ---------------------------------------------------------------------------
+
+/**
+ * owner 专属：把 userId 加入信任集。
+ * - 当前模式非 manual 时只提示启用方法（bootstrap 模式自动拉人，无需手动加）。
+ * - 加自己无效；userId 形态校验失败直接拒绝。
+ */
+export function handleTrust(ctx: CommandContext, args: string): CommandResult {
+  if (!ctx.trust) {
+    return { reply: '当前为 owner-only 模式，不需要手动添加信任用户。\n要放开多人对话，请先用 /trustmode 切换到 bootstrap 或 manual。', handled: true };
+  }
+  const ownerId = ctx.ownerUserId;
+  if (ownerId && ctx.fromUserId && ctx.fromUserId !== ownerId) {
+    return { reply: '⚠️ /trust 仅 owner 可用（信任集管理权限）。', handled: true };
+  }
+  const arg = args.trim();
+  if (!arg) {
+    return { reply: '用法: /trust <userId> [备注]\n例: /trust wxid_abc 老婆\n  /trustlist 查看当前信任集', handled: true };
+  }
+  const firstSpace = arg.search(/\s/);
+  const userId = (firstSpace === -1 ? arg : arg.slice(0, firstSpace)).trim();
+  const note = (firstSpace === -1 ? '' : arg.slice(firstSpace + 1).trim()) || undefined;
+  if (userId === ownerId) {
+    return { reply: 'ℹ️ owner 永远放行，不需要把自己加入信任集。', handled: true };
+  }
+  if (!isPlausibleUserId(userId)) {
+    return { reply: '⚠️ userId 格式不合法（应为 4-64 位字母/数字/_ . @ = -）。', handled: true };
+  }
+  const file = ctx.trust.load();
+  const next = addTrusted(file, userId, 'owner', note);
+  ctx.trust.save(next);
+  return {
+    reply: `✅ 已添加信任用户：${userId}${note ? `（${note}）` : ''}\n当前模式：${ctx.trust.listModeLabel()}\n（手动模式才会拦截陌生人；bootstrap 模式首位陌生人会自动入集，无需 /trust。）`,
+    handled: true,
+  };
+}
+
+/** owner 专属：从信任集移除 userId。 */
+export function handleDistrust(ctx: CommandContext, args: string): CommandResult {
+  if (!ctx.trust) {
+    return { reply: '当前为 owner-only 模式，没有信任集可管理。', handled: true };
+  }
+  const ownerId = ctx.ownerUserId;
+  if (ownerId && ctx.fromUserId && ctx.fromUserId !== ownerId) {
+    return { reply: '⚠️ /distrust 仅 owner 可用。', handled: true };
+  }
+  const userId = args.trim();
+  if (!userId) {
+    return { reply: '用法: /distrust <userId>\n查看列表：/trustlist', handled: true };
+  }
+  if (!isPlausibleUserId(userId)) {
+    return { reply: '⚠️ userId 格式不合法。', handled: true };
+  }
+  const file = ctx.trust.load();
+  if (!file.trusted[userId]) {
+    return { reply: `ℹ️ ${userId} 不在信任集中。\n查看列表：/trustlist`, handled: true };
+  }
+  const next = removeTrusted(file, userId);
+  ctx.trust.save(next);
+  return { reply: `✅ 已吊销：${userId}（后续消息会被拒绝，已存在的会话保留只读）`, handled: true };
+}
+
+/** owner 专属：列出当前 trustMode + 信任集。 */
+export function handleTrustList(ctx: CommandContext): CommandResult {
+  if (!ctx.trust) {
+    return { reply: '当前模式：owner-only（仅本机账号主人本人）\n要放开多人对话：/trustmode bootstrap|manual', handled: true };
+  }
+  const ownerId = ctx.ownerUserId;
+  if (ownerId && ctx.fromUserId && ctx.fromUserId !== ownerId) {
+    return { reply: '⚠️ /trustlist 仅 owner 可用。', handled: true };
+  }
+  const file = ctx.trust.load();
+  const rows = listTrusted(file);
+  const lines = [
+    `🔐 信任模式：${ctx.trust.listModeLabel()}`,
+    `owner：${ownerId || '（未绑定）'}`,
+    `信任用户：${rows.length} 个`,
+  ];
+  if (rows.length > 0) {
+    lines.push('');
+    for (const r of rows) {
+      const added = new Date(r.addedAt).toLocaleString('zh-CN');
+      const seen = r.lastSeenAt ? new Date(r.lastSeenAt).toLocaleString('zh-CN') : '从未活跃';
+      const note = r.note ? ` · ${r.note}` : '';
+      lines.push(`- ${r.userId}（添加于 ${added} · 最近 ${seen}${note}）`);
+    }
+  }
+  lines.push('');
+  lines.push('管理：/trust <userId> [备注] · /distrust <userId> · /trustmode [模式]');
+  return { reply: lines.join('\n'), handled: true };
+}
+
+/** owner 专属：查看或切换 trustMode。 */
+export function handleTrustMode(ctx: CommandContext, args: string): CommandResult {
+  const ownerId = ctx.ownerUserId;
+  if (ownerId && ctx.fromUserId && ctx.fromUserId !== ownerId) {
+    return { reply: '⚠️ /trustmode 仅 owner 可用。', handled: true };
+  }
+  const arg = args.trim().toLowerCase();
+  if (!arg) {
+    return {
+      reply: `当前信任模式：${ctx.trust ? ctx.trust.listModeLabel() : 'owner-only'}\n\n可选：\n  owner-only  仅本机主人（默认，单用户行为）\n  bootstrap    首位陌生人自动入集（一次性）\n  manual       仅 /trust 添加的人\n\n切换：/trustmode <模式>`,
+      handled: true,
+    };
+  }
+  if (arg !== 'owner-only' && arg !== 'bootstrap' && arg !== 'manual') {
+    return { reply: '⚠️ 模式必须是 owner-only / bootstrap / manual。', handled: true };
+  }
+  return {
+    reply: `✅ 信任模式已切换为：${arg}（立即生效，后续入站消息按新模式判定）`,
+    handled: true,
+    setTrustMode: arg,
   };
 }

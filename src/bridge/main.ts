@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { join, basename, extname } from 'node:path';
-import { unlinkSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { unlinkSync, writeFileSync, readFileSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 import { WeChatApi } from './wechat/api.js';
@@ -22,6 +22,7 @@ import { MessageType, type WeixinMessage } from './wechat/types.js';
 import { loadPendingQueue, savePendingQueue, type PendingItem } from './pending-queue.js';
 import { DshClient, type DshStreamEvent } from './dsh-client.js';
 import { createNotifyThrottle } from './notify.js';
+import { loadTrust, saveTrust, decideTrust, setTrustMode } from './trust.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -36,17 +37,53 @@ const MAX_MESSAGE_LENGTH = 4000;
 let lastActiveUserId = '';
 
 /**
- * iLink 主动发消息（bot → 用户）必须回传最近一次入站消息携带的
+ * iLink 主动发消息（bot → 用户）必须回传该用户最近一次入站消息携带的
  * context_token，空 token 会被服务端拒绝（ret:-2 "prepare failed"）。
- * 每次收到绑定用户的消息就刷新并持久化它，供主动通知 / 审批推送使用。
+ *
+ * P1-2 / M3：每个受信用户各存一份（入站消息按 from_user_id 刷新），
+ * 主动通知 / 审批推送显式带 userId 取对应 token；`lastContextToken`
+ * 保留为兜底（未带 userId 的旧调用路径 / 未知用户回退）。
  */
+const contextTokens = new Map<string, string>();
 let lastContextToken = '';
 
 function contextTokenPath(): string {
   return join(DATA_DIR, 'context-token.json');
 }
 
+function contextTokensPath(): string {
+  return join(DATA_DIR, 'context-tokens.json');
+}
+
+function persistContextTokens(): void {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    const tokens: Record<string, string> = {};
+    for (const [k, v] of contextTokens) tokens[k] = v;
+    writeFileSync(contextTokensPath(), JSON.stringify({ tokens, updatedAt: Date.now() }) + '\n', 'utf8');
+    // 旧单 token 文件继续写（最近一条），老版本工具/排查脚本仍可读。
+    writeFileSync(contextTokenPath(), JSON.stringify({ token: lastContextToken, updatedAt: Date.now() }) + '\n', 'utf8');
+    // 敏感 token 文件与 trust/config 对齐 0600，避免同机其他用户可读。
+    if (process.platform !== 'win32') {
+      chmodSync(contextTokensPath(), 0o600);
+      chmodSync(contextTokenPath(), 0o600);
+    }
+  } catch (err) {
+    logger.warn('Failed to persist context tokens', { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
 function loadContextToken(): void {
+  // per-user 表
+  try {
+    const parsed = JSON.parse(readFileSync(contextTokensPath(), 'utf8')) as { tokens?: Record<string, string> };
+    for (const [k, v] of Object.entries(parsed.tokens ?? {})) {
+      if (typeof v === 'string' && v && k) contextTokens.set(k, v);
+    }
+  } catch {
+    // 首次启动没有文件属正常
+  }
+  // 旧单 token 兜底
   try {
     const parsed = JSON.parse(readFileSync(contextTokenPath(), 'utf8')) as { token?: unknown };
     lastContextToken = typeof parsed.token === 'string' ? parsed.token : '';
@@ -55,15 +92,24 @@ function loadContextToken(): void {
   }
 }
 
-function updateContextToken(token: string): void {
-  if (!token || token === lastContextToken) return;
-  lastContextToken = token;
-  try {
-    mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(contextTokenPath(), JSON.stringify({ token, updatedAt: Date.now() }) + '\n', 'utf8');
-  } catch (err) {
-    logger.warn('Failed to persist context token', { error: err instanceof Error ? err.message : String(err) });
+/** 主动推送取 token：优先该用户最近入站的，缺省回退全局最近一条。 */
+function contextTokenFor(userId?: string): string {
+  if (userId && contextTokens.has(userId)) return contextTokens.get(userId)!;
+  return lastContextToken;
+}
+
+function updateContextToken(userId: string, token: string): void {
+  if (!token) return;
+  let changed = false;
+  if (userId && contextTokens.get(userId) !== token) {
+    contextTokens.set(userId, token);
+    changed = true;
   }
+  if (token !== lastContextToken) {
+    lastContextToken = token;
+    changed = true;
+  }
+  if (changed) persistContextTokens();
 }
 
 // ---------------------------------------------------------------------------
@@ -385,12 +431,14 @@ async function runSetup(): Promise<void> {
 
 async function runDaemon(): Promise<void> {
   const config = loadConfig();
-  const account = loadLatestAccount();
+  const loadedAccount = loadLatestAccount();
 
-  if (!account) {
+  if (!loadedAccount) {
     console.error('未找到微信账号，请先运行: node lib/bridge/main.js setup');
     process.exit(1);
   }
+  // 守卫后 account 必非 null；闭包（信任门禁等）拿不到收窄，这里显式声明非空。
+  const account: AccountData = loadedAccount;
 
   const apiBase = process.env.DSH_BRIDGE_API_BASE;
   const apiToken = process.env.DSH_BRIDGE_API_TOKEN;
@@ -401,19 +449,15 @@ async function runDaemon(): Promise<void> {
 
   const client = new DshClient(apiBase, apiToken);
   const api = new WeChatApi(account.botToken, account.baseUrl);
-  const sessionStore = createSessionStore();
-  const session: Session = sessionStore.load(account.accountId);
-
-  if (config.workingDirectory && session.workingDirectory === process.cwd()) {
-    session.workingDirectory = config.workingDirectory;
-    sessionStore.save(account.accountId, session);
-  }
-
-  if (session.state !== 'idle') {
-    logger.warn('Resetting stale session state on startup', { state: session.state });
-    session.state = 'idle';
-    sessionStore.save(account.accountId, session);
-  }
+  const sessionStore = createSessionStore({
+    botAccountId: account.accountId,
+    ownerUserId: account.userId,
+    defaultWorkingDirectory: config.workingDirectory,
+  });
+  // 升级到多用户：把旧单用户数据 ${accountId}.json 迁移到 ${accountId}__${ownerUserId}.json，
+  // 并把本 bot 所有会话的陈旧 'processing' 状态重置为 'idle'（崩溃恢复）。
+  sessionStore.runMigrations();
+  sessionStore.resetStaleStates();
 
   const sender = createSender(api, account.accountId);
   lastActiveUserId = account.userId || '';
@@ -424,9 +468,13 @@ async function runDaemon(): Promise<void> {
   // Proactive notification endpoint (DSH → daemon), throttled.
   // WeChat personal accounts are sensitive to proactive high-frequency pushes,
   // so notifications go through a queue + rate limits (see notify.ts).
+  // P1-2 / M3：body 可带 userId 指定目标用户（取该用户的 context_token），
+  // 缺省回退 lastActiveUserId（旧调用路径兼容）。
   // -------------------------------------------------------------------------
-  const notifyThrottle = createNotifyThrottle((message) =>
-    sender.sendText(lastActiveUserId, lastContextToken, message));
+  const notifyThrottle = createNotifyThrottle((message, userId) => {
+    const target = userId || lastActiveUserId;
+    return sender.sendText(target, contextTokenFor(target), message);
+  });
   const notifyPortPath = join(DATA_DIR, 'daemon-port.json');
   const notifyServer = createServer((req, res) => {
     const token = process.env.DSH_BRIDGE_API_TOKEN;
@@ -454,8 +502,9 @@ async function runDaemon(): Promise<void> {
     });
     req.on('end', () => {
       try {
-        const parsed = JSON.parse(body) as { message?: unknown };
+        const parsed = JSON.parse(body) as { message?: unknown; userId?: unknown };
         const message = String(parsed?.message ?? '');
+        const targetUserId = typeof parsed?.userId === 'string' && parsed.userId ? parsed.userId : undefined;
         // 审批是阻塞交互且量极低（由用户自己的任务触发），绕过节流直发，
         // 否则 60s 的最小通知间隔会把审批拖到超时。
         if (isApproval) {
@@ -464,7 +513,8 @@ async function runDaemon(): Promise<void> {
             res.end(JSON.stringify({ ok: false, error: 'empty message' }));
             return;
           }
-          sender.sendText(lastActiveUserId, lastContextToken, message)
+          const target = targetUserId || lastActiveUserId;
+          sender.sendText(target, contextTokenFor(target), message)
             .then(() => {
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ ok: true }));
@@ -475,7 +525,7 @@ async function runDaemon(): Promise<void> {
             });
           return;
         }
-        const result = notifyThrottle.enqueue(message);
+        const result = notifyThrottle.enqueue(message, targetUserId);
         res.writeHead(result.accepted ? 200 : 400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch {
@@ -494,45 +544,113 @@ async function runDaemon(): Promise<void> {
   } catch (err) {
     logger.warn('Failed to persist notify endpoint info', { error: err instanceof Error ? err.message : String(err) });
   }
-  const messageQueue: WeixinMessage[] = [];
-  let processingQueue = false;
+  // -------------------------------------------------------------------------
+  // P1-2 / M3：per-user 消息队列——A 的长任务不再阻塞 B。
+  // 每个用户一条队列串行消费；用户之间并行（host 侧本来就是独立 agent）。
+  // -------------------------------------------------------------------------
+  const messageQueues = new Map<string, WeixinMessage[]>();
+  const drainingUsers = new Set<string>();
 
-  async function drainQueue(): Promise<void> {
-    if (processingQueue) return;
-    processingQueue = true;
-    while (messageQueue.length > 0) {
-      const msg = messageQueue.shift()!;
-      await handleMessage(msg, account!, session, sessionStore, sender, config, client, messageQueue);
+  function enqueueMessage(msg: WeixinMessage): void {
+    const uid = msg.from_user_id!;
+    let q = messageQueues.get(uid);
+    if (!q) {
+      q = [];
+      messageQueues.set(uid, q);
     }
-    processingQueue = false;
+    q.push(msg);
+    void drainUserQueue(uid);
+  }
+
+  async function drainUserQueue(userId: string): Promise<void> {
+    if (drainingUsers.has(userId)) return;
+    drainingUsers.add(userId);
+    try {
+      const q = messageQueues.get(userId);
+      while (q && q.length > 0) {
+        const msg = q.shift()!;
+        await handleMessage(msg, account!, sessionStore, sender, config, client, q);
+      }
+    } catch (err) {
+      logger.error('drainUserQueue failed', { userId, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      drainingUsers.delete(userId);
+    }
+  }
+
+  /**
+   * 信任门禁判定（供 onMessage / 优先命令复用）：
+   * 返回 null = 放行；返回字符串 = 拒绝原因（已记日志，必要时已通知 owner）。
+   * bootstrap 自动入集 / lastSeenAt 刷新等副作用在此落盘（lastSeenAt 60s 节流）。
+   */
+  let lastTrustSeenPersist = 0;
+  function checkTrustGate(msg: WeixinMessage): string | null {
+    const trustFile = loadTrust();
+    const decision = decideTrust({
+      fromUserId: msg.from_user_id ?? '',
+      ownerUserId: account.userId,
+      file: trustFile,
+    });
+    if (decision.file !== trustFile) {
+      // bootstrap 自动入集必落盘；trusted 分支的 lastSeenAt 刷新节流到 60s 一次，
+      // 避免每条消息都写盘（面板「最近活跃」有秒级精度足够）。
+      if (decision.reason !== 'trusted' || Date.now() - lastTrustSeenPersist > 60_000) {
+        saveTrust(decision.file);
+        lastTrustSeenPersist = Date.now();
+      }
+    }
+    if (decision.allowed) return null;
+    logger.info('Inbound message rejected by trust gate', {
+      fromUserId: msg.from_user_id,
+      reason: decision.reason,
+      mode: trustFile.mode,
+    });
+    // 可选：通知 owner 有人尝试联系（不回复陌生人，避免泄露任何内部信息）。
+    // 走 notifyThrottle 队列，避免陌生人多条消息刷屏直撞 iLink 主动推送风控。
+    if (config.notifyRejected && account.userId && msg.item_list) {
+      const text = extractTextFromItems(msg.item_list).slice(0, 80) || '(非文本)';
+      const hint = `🔒 陌生人尝试联系：${msg.from_user_id}\n内容预览：${text}`;
+      notifyThrottle.enqueue(hint, account.userId);
+    }
+    return decision.reason;
   }
 
   function handlePriorityCommand(msg: WeixinMessage): boolean {
     if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
-    // Priority commands are destructive (cancel in-flight turn / clear session).
-    // Fail-closed sender check: only the bound account owner may trigger them,
-    // otherwise any contact could stop or wipe someone's running work.
+    // 破坏性命令（取消进行中任务 / 清空会话）：发送者必须先过信任门禁
+    // （onMessage 已检），且只作用于自己的会话。
+    // owner-only 模式下与原行为一致：仅 owner 本人。
     const ownerId = account?.userId;
-    if (!ownerId || msg.from_user_id !== ownerId) return false;
+    const trustFile = loadTrust();
+    if (trustFile.mode === 'owner-only') {
+      if (!ownerId || msg.from_user_id !== ownerId) return false;
+    } else if (!msg.from_user_id) {
+      return false;
+    }
     const text = extractTextFromItems(msg.item_list);
     if (!/^\/(?:stop|clear|new)(?:\s|$)/i.test(text)) return false;
-    if (session.state !== 'processing') return false;
+    const userId = msg.from_user_id!;
+    const sessionKey = sessionStore.keyFor(userId);
+    const userSession = sessionStore.load(userId);
+    if (userSession.state !== 'processing') return false;
 
-    messageQueue.length = 0;
+    // 只清自己的排队消息，不影响其他用户。
+    const q = messageQueues.get(userId);
+    if (q) q.length = 0;
     if (/^\/(?:clear|new)(?:\s|$)/i.test(text)) {
-      const cleared = sessionStore.clear(account!.accountId, session);
-      Object.assign(session, cleared);
+      const cleared = sessionStore.clear(userId, userSession);
+      Object.assign(userSession, cleared);
     } else {
-      session.state = 'idle';
-      sessionStore.save(account!.accountId, session);
+      userSession.state = 'idle';
+      sessionStore.save(userId, userSession);
     }
 
     if (text.trim().toLowerCase().startsWith('/stop')) {
-      client.stop(account!.accountId).catch(() => {});
-      sender.sendText(msg.from_user_id!, msg.context_token ?? '', '⏹ 已停止当前对话，排队中的消息已清空。').catch(() => {});
+      client.stop(sessionKey).catch(() => {});
+      sender.sendText(userId, msg.context_token ?? '', '⏹ 已停止当前对话，排队中的消息已清空。').catch(() => {});
     } else {
-      client.clear(account!.accountId).catch(() => {});
-      sender.sendText(msg.from_user_id!, msg.context_token ?? '', '✅ 会话已清除。').catch(() => {});
+      client.clear(sessionKey).catch(() => {});
+      sender.sendText(userId, msg.context_token ?? '', '✅ 会话已清除。').catch(() => {});
     }
     return true;
   }
@@ -540,20 +658,28 @@ async function runDaemon(): Promise<void> {
   /**
    * 审批回复是时间敏感的交互（host 侧的 agent 正挂着等裁决），必须像
    * /stop 一样抢在消息队列之前处理——否则排队到任务结束就死锁到超时。
-   * 同样 fail-closed：只认绑定账号本人的 /yes /no。
+   * 多用户下任何受信用户都可回复 /yes /no，但只裁决自己 session 的 pending
+   * （host 侧 approvalManager 按 session key 归属，双保险）。
    */
   async function handleApprovalReply(msg: WeixinMessage): Promise<boolean> {
     if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
     const ownerId = account?.userId;
-    if (!ownerId || msg.from_user_id !== ownerId) return false;
+    const trustFile = loadTrust();
+    if (trustFile.mode === 'owner-only') {
+      if (!ownerId || msg.from_user_id !== ownerId) return false;
+    } else if (!msg.from_user_id) {
+      return false;
+    }
     const text = extractTextFromItems(msg.item_list).trim();
     const match = /^\/(yes|no)(?:\s|$)/i.exec(text);
     if (!match) return false;
     const approved = match[1].toLowerCase() === 'yes';
+    const userId = msg.from_user_id!;
+    const sessionKey = sessionStore.keyFor(userId);
 
     let reply: string;
     try {
-      const result = await client.decideApproval(account!.accountId, approved);
+      const result = await client.decideApproval(sessionKey, approved);
       if (result.ok) {
         reply = approved
           ? `✅ 已批准${result.toolName ? `：${result.toolName}` : ''}，任务继续执行。`
@@ -566,7 +692,7 @@ async function runDaemon(): Promise<void> {
     } catch {
       reply = '⚠️ 审批结果未能送达 DSH，请到电脑端确认任务状态。';
     }
-    await sender.sendText(ownerId, msg.context_token ?? '', reply).catch(() => {});
+    await sender.sendText(userId, msg.context_token ?? '', reply).catch(() => {});
     return true;
   }
 
@@ -583,14 +709,22 @@ async function runDaemon(): Promise<void> {
         }
         scheduleDedupSave();
       }
-      // 绑定用户的每条入站消息都刷新 context_token（主动推送的通行证）。
-      if (msg.context_token && msg.from_user_id && msg.from_user_id === account?.userId) {
-        updateContextToken(msg.context_token);
+
+      // P1-2 / M1：信任门禁——优先命令与审批回复也受门禁约束（在门禁之后处理）。
+      if (msg.message_type === MessageType.USER && msg.from_user_id) {
+        if (checkTrustGate(msg) !== null) return;
+        // 受信用户的每条入站消息都刷新该用户的 context_token（主动推送通行证）。
+        if (msg.context_token) {
+          lastActiveUserId = msg.from_user_id;
+          updateContextToken(msg.from_user_id, msg.context_token);
+        }
       }
+
       if (handlePriorityCommand(msg)) return;
       if (await handleApprovalReply(msg)) return;
-      messageQueue.push(msg);
-      drainQueue();
+      if (msg.message_type === MessageType.USER && msg.from_user_id) {
+        enqueueMessage(msg);
+      }
     },
     onSessionExpired: () => {
       logger.warn('Session expired, will keep retrying...');
@@ -638,7 +772,6 @@ async function runDaemon(): Promise<void> {
 async function handleMessage(
   msg: WeixinMessage,
   account: AccountData,
-  session: Session,
   sessionStore: ReturnType<typeof createSessionStore>,
   sender: ReturnType<typeof createSender>,
   config: ReturnType<typeof loadConfig>,
@@ -647,13 +780,16 @@ async function handleMessage(
 ): Promise<void> {
   if (msg.message_type !== MessageType.USER) return;
   if (!msg.from_user_id || !msg.item_list) return;
-  // Fail-closed: with no known owner we accept nobody. login.ts guarantees a
-  // real userId on save, but an empty/legacy field must deny, not allow-all.
-  if (!account.userId || msg.from_user_id !== account.userId) return;
+
+  // 门禁判定（拒绝/放行）已在 onMessage 统一执行（含优先命令与审批回复），
+  // 这里重读 trust.json 只是为了给命令上下文提供当前信任状态（trustCtx），不是重复判定。
+  const trustFile = loadTrust();
 
   const contextToken = msg.context_token ?? '';
   const fromUserId = msg.from_user_id;
-  lastActiveUserId = fromUserId;
+
+  // 加载该用户的独立 session（P1-2 / M2：per-user 会话隔离）。
+  const session = sessionStore.load(fromUserId);
 
   const userText = extractTextFromItems(msg.item_list);
   const imageItem = extractFirstImageUrl(msg.item_list);
@@ -669,30 +805,54 @@ async function handleMessage(
   if (userText.startsWith('/')) {
     const updateSession = (partial: Partial<Session>) => {
       Object.assign(session, partial);
-      sessionStore.save(account.accountId, session);
+      sessionStore.save(fromUserId, session);
     };
+
+    const trustCtx = trustFile.mode === 'owner-only'
+      ? undefined
+      : {
+          load: loadTrust,
+          save: saveTrust,
+          listModeLabel: () => {
+            switch (trustFile.mode) {
+              case 'owner-only': return 'owner-only（仅本机主人）';
+              case 'bootstrap': return `bootstrap${trustFile.bootstrapConsumed ? '（已用完首次）' : '（首次联系自动入集）'}`;
+              case 'manual': return 'manual（仅 /trust 添加的人）';
+            }
+          },
+        };
 
     const ctx: CommandContext = {
       accountId: account.accountId,
+      fromUserId,
+      ownerUserId: account.userId,
       session,
       updateSession,
-      clearSession: () => sessionStore.clear(account.accountId),
+      clearSession: () => sessionStore.clear(fromUserId),
       getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
       text: userText,
       listProjects: () => client.listProjects(),
       selectProject: (sessionId: string) => client.selectProject(sessionId),
       detachProject: () => client.detachProject(),
       getStatus: () => client.status(),
+      trust: trustCtx,
     };
 
     const result: CommandResult = await routeCommand(ctx);
+
+    // /trustmode 的副作用：写入 trust.json（唯一真相源），并即时刷新内存视图。
+    if (result.setTrustMode) {
+      const updated = setTrustMode(loadTrust(), result.setTrustMode);
+      saveTrust(updated);
+    }
 
     if (result.handled && result.reply) {
       await sender.sendText(fromUserId, contextToken, result.reply);
       // /clear and /new must also clear the real DSH session (and its persisted
       // id mapping), even when the daemon is idle and not just mid-turn.
       if (/^\/(?:clear|new)(?:\s|$)/i.test(userText.trim())) {
-        await client.clear(account.accountId).catch((err) => {
+        const sessionKey = sessionStore.keyFor(fromUserId);
+        await client.clear(sessionKey).catch((err) => {
           logger.warn('Failed to clear DSH session from slash command', {
             error: err instanceof Error ? err.message : String(err),
           });
@@ -737,8 +897,12 @@ async function sendToDsh(
   config: ReturnType<typeof loadConfig>,
   client: DshClient,
 ): Promise<void> {
+  // P1-2 / M2：session key = botAccountId::userId —— 每个微信用户独立会话。
+  // owner 也走同一套路径（与迁移后的数据一致）。
+  const sessionKey = sessionStore.keyFor(fromUserId);
+
   session.state = 'processing';
-  sessionStore.save(account.accountId, session);
+  sessionStore.save(fromUserId, session);
 
   sessionStore.addChatMessage(session, 'user', userText || '(图片/文件)');
   const stopTyping = sender.startTyping(fromUserId, contextToken);
@@ -771,7 +935,7 @@ async function sendToDsh(
 
     const accepted = await client.prompt({
       text: prompt,
-      sessionId: account.accountId,
+      sessionId: sessionKey,
       cwd: (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir()),
       model: session.model,
       systemPrompt: config.systemPrompt,
@@ -781,7 +945,7 @@ async function sendToDsh(
     if (!accepted) {
       await sender.sendText(fromUserId, contextToken, '消息已收到，但 DSH 未接受处理请求。');
       session.state = 'idle';
-      sessionStore.save(account.accountId, session);
+      sessionStore.save(fromUserId, session);
       return;
     }
 
@@ -844,7 +1008,7 @@ async function sendToDsh(
     }, 2000);
 
     const controller = new AbortController();
-    await client.stream(account.accountId, (event: DshStreamEvent) => {
+    await client.stream(sessionKey, (event: DshStreamEvent) => {
       switch (event.type) {
         case 'chunk':
           if (event.text) {
@@ -918,7 +1082,7 @@ async function sendToDsh(
     await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
   } finally {
     session.state = 'idle';
-    sessionStore.save(account.accountId, session);
+    sessionStore.save(fromUserId, session);
     stopTyping();
   }
 }

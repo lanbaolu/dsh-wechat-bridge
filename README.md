@@ -23,7 +23,8 @@
 - **微信内审批**：agent 请求权限时推送审批消息到微信，回复 `/yes` 批准、`/no` 拒绝；超时自动拒绝（fail-closed），仅绑定账号本人可裁决，不影响桌面 GUI 会话。
 - 防卡死：微信会话自动注入通道约束提示词，禁用浏览器端交互式选项工具（手机看不到会永久阻塞），改用纯文本编号选项。
 - 文件双向：微信发图片/文件给 DSH；DSH 回复中提到的本地文件会自动推回微信。
-- 消息队列：处理中收到的普通消息会排队，等当前任务结束后继续处理。
+- 消息队列：处理中收到的普通消息会排队，等当前任务结束后继续处理（多用户下按用户独立排队，A 的长任务不阻塞 B）。
+- **多用户支持**：信任集 + per-user 会话。可让多个微信用户与同一 bot 对话，每人独立会话/上下文/队列/审批归属，互不可见；信任集可控、可吊销（详见下方「安全模型」）。
 
 ### 媒体能力矩阵（2026-08-21 代码核实 + 真机抽验）
 
@@ -131,6 +132,40 @@ node lib/bridge/main.js setup
 | `/prompt [内容]` | 查看 / 设置系统提示词 |
 | `/history [数量]` | 查看最近对话 |
 | `/send <路径>` | 发送本地文件到微信 |
+| `/trust <userId> [备注]` | 添加信任用户（manual 模式；仅 owner） |
+| `/distrust <userId>` | 吊销信任用户（仅 owner） |
+| `/trustlist` | 查看信任集（仅 owner） |
+| `/trustmode [模式]` | 查看/切换信任模式（owner-only / bootstrap / manual） |
+
+## 安全模型（多用户信任集）
+
+> iLink 微信协议的扫码绑定是 **bot 自身** 登录（不是用户配对）。因此"多用户"的边界在协议层之上划定：把可信微信用户的 `from_user_id` 加进**信任集**，放行/拒绝入站。
+
+### 信任模式（fail-closed 默认）
+
+| 模式 | 行为 | 适用 |
+|---|---|---|
+| `owner-only`（默认） | 只认绑定账号 owner 本人，陌生人一律拒绝 | 单用户，行为与旧版完全一致 |
+| `bootstrap` | 首个联系的陌生人自动入信任集（一次性），之后不再自动 | 快速开号试用 |
+| `manual` | 仅 owner 用 `/trust` 或 Web 面板显式添加的人可对话 | 正式多人使用 |
+
+- 信任集持久化在 `trust.json`（0600），`mode` 是唯一真相源；`config.json` 只存 `notifyRejected`。
+- **拒绝原则**：陌生人消息只记日志、不回复（不泄露任何内部信息）；可选 `notifyRejected: true` 让 owner 收到「陌生人尝试联系」提醒（Web 面板或 `/trustmode` 后由面板开关）。
+- **吊销即失效**：`/distrust` 或面板「吊销」后，该用户新消息立刻被拒绝；其历史会话文件保留只读（不丢历史）。
+
+### per-user 隔离
+
+- 每个受信用户（含 owner）一套独立：DSH 会话（`${botAccountId}::${userId}` 为 key）、会话文件、消息队列、上下文 token、`/history` `/status` `/cwd` `/model`。
+- A 的任务进行中，B 发消息不会被阻塞（独立队列）；A 的 `/yes` `/no` 只裁决 A 自己 agent 的待审批（审批 key 归属 session key），B 无权替 A 裁决。
+- 项目绑定两级粒度：Web 面板选择项目会话 → 对该 bot 下**所有**用户生效；微信内 `/session` 绑定 → 仅对当前用户生效。
+
+### 升级迁移
+
+- 旧单用户数据自动迁移：`sessions/<accountId>.json` → `sessions/<accountId>__<ownerUserId>.json`，`session-ids.json` 旧 key → `${accountId}::${ownerUserId}`，迁移留痕日志，绝不丢历史；无法确定 owner 的旧数据保留原样只读。
+
+> ⚠️ **验证状态（如实标注）**：信任集判定与迁移逻辑有纯函数单测覆盖（39 项）；
+> owner-only 模式已真机回归（行为与旧版一致）。**多用户路径（bootstrap 入集、双用户隔离并发）
+> 真机验证待补**——需要第二个微信账号走查，在此之前请仅在受控环境开启 `bootstrap`/`manual` 模式。
 
 ## 数据目录
 
@@ -141,6 +176,8 @@ node lib/bridge/main.js setup
 ├── accounts/       # 微信账号凭证（0600）
 ├── sessions/       # 每个微信账号的本地会话状态
 ├── session-ids.json # 微信账号 → DSH 持久化会话 ID 映射（用于重启后 resume）
+├── trust.json       # 多用户信任集（模式 + 信任用户，0600）
+├── context-tokens.json # per-user context_token（主动推送/审批通行证）
 ├── pending-queue/  # 发送失败暂存队列
 ├── daemon-port.json # 守护进程 notify 端点端口（token 鉴权）
 ├── notify-stats.json # 主动通知每日配额计数

@@ -34,6 +34,8 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import { startQrLogin, checkQrStatus } from './bridge/wechat/login.js'
 import { loadJson, saveJson, validateAccountId } from './bridge/store.js'
 import type { NotifyStatus } from './bridge/notify.js'
+import { loadTrust, saveTrust, addTrusted, removeTrusted, setTrustMode, listTrusted, isPlausibleUserId, type TrustFile, type TrustMode } from './bridge/trust.js'
+import { parseSessionKey } from './bridge/session-key.js'
 
 export const name = '@lanbaolu/dsh-wechat-bridge'
 
@@ -182,6 +184,30 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  /**
+   * 多用户迁移（P1-2 / M2）：旧单用户时代 session-ids.json 的 key 是 bot accountId，
+   * 新版统一为 `${accountId}::${userId}`。能确定 owner 的条目一次性改名为新 key
+   * （owner 的 DSH 会话无缝续上）；不能确定的保留原样不动（绝不丢历史，
+   * 只是该条目不会再被命中，新消息走新 key）。
+   */
+  function migrateSessionIdMap(): void {
+    const map = loadSessionIdMap()
+    let changed = false
+    for (const key of Object.keys(map)) {
+      if (key.includes('::')) continue
+      const owner = ownerUserIdOf(key)
+      if (!owner) continue
+      const newKey = `${key}::${owner}`
+      if (!(newKey in map)) {
+        map[newKey] = map[key]
+        delete map[key]
+        changed = true
+        debugLog('session-ids.json migrated to per-user key', { oldKey: key, newKey })
+      }
+    }
+    if (changed) saveSessionIdMap(map)
+  }
+
   // -------------------------------------------------------------------------
   // Explicit project-conversation binding (Web panel selection)
   // -------------------------------------------------------------------------
@@ -219,8 +245,59 @@ export function apply(ctx: Context, config: Config): void {
 
   const selectedSessionIds = new Map<string, string>(Object.entries(loadSelectedSessionIds()))
 
-  function newDshSessionId(accountId: string): string {
-    return `wb-${accountId}-${Date.now()}-${randomBytes(4).toString('hex')}`
+  function newDshSessionId(key: string): string {
+    // 多用户 key 形如 ${botAccountId}::${userId}——DSH 会话 ID 会进文件路径，
+    // ':' 在 Windows 上是非法文件名字符，统一清洗为 '-'。
+    const safe = key.replace(/[^A-Za-z0-9_.@-]/g, '-')
+    return `wb-${safe}-${Date.now()}-${randomBytes(4).toString('hex')}`
+  }
+
+  /** session key 的 bot 账号前缀（'::' 之前；单段 key 原样返回）。 */
+  function botPrefixOf(key: string): string {
+    const i = key.indexOf('::')
+    return i === -1 ? key : key.slice(0, i)
+  }
+
+  /** 从 session key 解出微信用户 ID（单段旧 key 返回空）。 */
+  function userIdOfKey(key: string): string {
+    return parseSessionKey(key)?.userId || ''
+  }
+
+  // -------------------------------------------------------------------------
+  // 信任集（多用户支持 P1-2 / M1）——trust.json 是唯一真相源
+  // -------------------------------------------------------------------------
+
+  function trustPath(): string {
+    return join(dataDir, 'trust.json')
+  }
+
+  function loadTrustFile(): TrustFile {
+    return loadTrust(trustPath())
+  }
+
+  function saveTrustFile(file: TrustFile): void {
+    saveTrust(file, trustPath())
+  }
+
+  /** owner userId：最新绑定账号的 userId（用于面板展示与账号级会话文件定位）。 */
+  function ownerUserIdOf(accountId: string): string {
+    try {
+      const acc = loadJson<{ userId?: unknown }>(join(dataDir, 'accounts', `${accountId}.json`), {})
+      return typeof acc.userId === 'string' ? acc.userId : ''
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * daemon 侧会话文件名：session key `${bot}::${user}` → `${bot}__${user}`；
+   * 账号级 key（面板操作）→ 定位 owner 的 per-user 文件，找不到才退回旧文件名。
+   */
+  function bridgeSessionStem(key: string): string {
+    if (key.includes('::')) return key.replace(/::/g, '__')
+    const owner = ownerUserIdOf(key)
+    if (owner && /^[A-Za-z0-9_.\-@=]+$/.test(owner)) return `${key}__${owner}`
+    return key
   }
 
   // -------------------------------------------------------------------------
@@ -258,7 +335,13 @@ export function apply(ctx: Context, config: Config): void {
       // when there is no mapping, the old log is gone/corrupt, or the requested
       // workspace differs from the persisted session's cwd (unless the user
       // explicitly bound the bridge to a project conversation).
+      //
+      // 项目绑定两级粒度：
+      //  - session key 级（微信内 /session 绑定）：只对当前用户生效；
+      //  - 账号级（Web 面板选择）：对该 bot 下所有用户生效（前缀回退查找）。
       const selectedSessionId = selectedSessionIds.get(accountId)
+        ?? (accountId.includes('::') ? selectedSessionIds.get(botPrefixOf(accountId)) : undefined)
+      const selectedIsAccountLevel = !!selectedSessionId && !selectedSessionIds.has(accountId)
       let dshSessionId = sessionIds.get(accountId)
       let handle: AgentHandle | undefined
       let resumed = false
@@ -336,9 +419,9 @@ export function apply(ctx: Context, config: Config): void {
       const finalSessionId = dshSessionId!
       sessionIds.set(accountId, finalSessionId)
       persistSessionId(accountId, finalSessionId)
-      if (isSelected) {
+      if (isSelected && !selectedIsAccountLevel) {
         persistSelectedSessionId(accountId, finalSessionId)
-      } else if (selectedSessionIds.has(accountId)) {
+      } else if (!selectedIsAccountLevel && selectedSessionIds.has(accountId)) {
         selectedSessionIds.delete(accountId)
         removeSelectedSessionId(accountId)
       }
@@ -549,22 +632,24 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  function readBridgeAccountSession(accountId: string): Record<string, unknown> {
-    validateAccountId(accountId)
-    return loadJson<Record<string, unknown>>(join(dataDir, 'sessions', `${accountId}.json`), {})
+  function readBridgeAccountSession(key: string): Record<string, unknown> {
+    const stem = bridgeSessionStem(key)
+    validateAccountId(stem)
+    return loadJson<Record<string, unknown>>(join(dataDir, 'sessions', `${stem}.json`), {})
   }
 
-  function writeBridgeAccountSession(accountId: string, session: Record<string, unknown>): void {
-    validateAccountId(accountId)
-    saveJson(join(dataDir, 'sessions', `${accountId}.json`), session)
+  function writeBridgeAccountSession(key: string, session: Record<string, unknown>): void {
+    const stem = bridgeSessionStem(key)
+    validateAccountId(stem)
+    saveJson(join(dataDir, 'sessions', `${stem}.json`), session)
   }
 
-  function resetBridgeAccountSession(accountId: string, cwd: string): void {
-    const session = readBridgeAccountSession(accountId)
+  function resetBridgeAccountSession(key: string, cwd: string): void {
+    const session = readBridgeAccountSession(key)
     session.workingDirectory = cwd
     session.state = 'idle'
     session.chatHistory = []
-    writeBridgeAccountSession(accountId, session)
+    writeBridgeAccountSession(key, session)
   }
 
   async function selectProjectSession(dshSessionId: string, accountId?: string): Promise<Record<string, unknown>> {
@@ -595,11 +680,10 @@ export function apply(ctx: Context, config: Config): void {
       return { ok: false, error: '该会话当前正在 DSH 中打开，请先在 DSH 中关闭该会话后再绑定。' }
     }
 
-    // Drop the current bridge-owned agent so the next message resumes the
+    // Drop the current bridge-owned agent(s) so the next message resumes the
     // selected project conversation instead of the previous bridge session.
-    if (agents.has(target) || sessionIds.has(target)) {
-      await disposeAgent(target)
-    }
+    // 多用户：账号级绑定影响该 bot 下所有 per-user agent。
+    await disposeKeysUnder(target)
 
     selectedSessionIds.set(target, dshSessionId)
     persistSelectedSessionId(target, dshSessionId)
@@ -618,11 +702,19 @@ export function apply(ctx: Context, config: Config): void {
   async function detachProjectSession(accountId?: string): Promise<Record<string, unknown>> {
     const target = accountId || latestAccountId()
     if (!target) return { ok: false, error: '没有已绑定的微信账号。' }
-    await disposeAgent(target)
+    await disposeKeysUnder(target)
     const config = readBridgeConfig()
     resetBridgeAccountSession(target, config.workingDirectory)
     const daemonResult = daemonRunning() ? await restartDaemon() : { ok: true, message: '守护进程未运行，解除绑定将在下次启动时生效。' }
     return { ok: true, accountId: target, daemon: daemonResult.message }
+  }
+
+  /** dispose 精确匹配 key 及其 `${key}::` 前缀下的全部 agent（账号级操作用于多用户）。 */
+  async function disposeKeysUnder(key: string): Promise<void> {
+    const targets = [...agents.keys()].filter((k) => k === key || k.startsWith(`${key}::`))
+    for (const k of targets) {
+      await disposeAgent(k)
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -962,17 +1054,19 @@ export function apply(ctx: Context, config: Config): void {
     return join(dataDir, 'config.json')
   }
 
-  function readBridgeConfig(): { workingDirectory: string; model?: string; systemPrompt?: string } {
+  function readBridgeConfig(): { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean } {
     try {
       const raw = JSON.parse(readFileSync(bridgeConfigPath(), 'utf8')) as {
         workingDirectory?: string
         model?: string
         systemPrompt?: string
+        notifyRejected?: boolean | string
       }
       return {
         workingDirectory: raw.workingDirectory || join(homedir(), 'Documents', 'DSH'),
         model: raw.model,
         systemPrompt: raw.systemPrompt,
+        notifyRejected: raw.notifyRejected === true || raw.notifyRejected === 'true',
       }
     } catch {
       return {
@@ -981,13 +1075,23 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  function saveBridgeConfig(config: { workingDirectory: string; model?: string; systemPrompt?: string }): void {
+  function saveBridgeConfig(config: { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean }): void {
     mkdirSync(dataDir, { recursive: true })
-    const data: Record<string, string> = {
+    // 合并写回：不覆盖 daemon 侧写入的其他字段（如 usageFooter）。
+    let existing: Record<string, unknown> = {}
+    try {
+      const raw = JSON.parse(readFileSync(bridgeConfigPath(), 'utf8'))
+      if (raw && typeof raw === 'object') existing = raw as Record<string, unknown>
+    } catch {
+      // 首次写入
+    }
+    const data: Record<string, unknown> = {
+      ...existing,
       workingDirectory: config.workingDirectory,
     }
     if (config.model) data.model = config.model
     if (config.systemPrompt) data.systemPrompt = config.systemPrompt
+    if (config.notifyRejected !== undefined) data.notifyRejected = config.notifyRejected
     writeFileSync(bridgeConfigPath(), JSON.stringify(data, null, 2) + '\n', 'utf8')
     if (process.platform !== 'win32') {
       chmodSync(bridgeConfigPath(), 0o600)
@@ -1085,7 +1189,67 @@ export function apply(ctx: Context, config: Config): void {
       accounts: accountFiles,
       sessions: [...sessionIds.keys()],
       selectedProject: await selectedProjectPayload(),
+      trust: trustPayload(),
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // 信任集管理（P1-2 / M4：面板 + 内部 API）
+  // -------------------------------------------------------------------------
+
+  function trustPayload(): Record<string, unknown> {
+    const file = loadTrustFile()
+    const latest = latestAccountId()
+    return {
+      mode: file.mode,
+      bootstrapConsumed: file.bootstrapConsumed === true,
+      owner: latest ? ownerUserIdOf(latest) : '',
+      notifyRejected: readBridgeConfig().notifyRejected === true,
+      trusted: listTrusted(file),
+    }
+  }
+
+  function trustAdd(userId: string, note?: string): { ok: boolean; error?: string } {
+    const id = String(userId || '').trim()
+    if (!isPlausibleUserId(id)) {
+      return { ok: false, error: 'userId 格式不合法（应为 4-64 位字母/数字/_ . @ = -）' }
+    }
+    const file = loadTrustFile()
+    const latest = latestAccountId()
+    if (latest && id === ownerUserIdOf(latest)) {
+      return { ok: false, error: 'owner 永远放行，不需要加入信任集' }
+    }
+    saveTrustFile(addTrusted(file, id, 'owner', note?.trim() || undefined))
+    debugLog('trust add via panel', { userId: id })
+    return { ok: true }
+  }
+
+  function trustRemove(userId: string): { ok: boolean; error?: string } {
+    const id = String(userId || '').trim()
+    const file = loadTrustFile()
+    if (!file.trusted[id]) {
+      return { ok: false, error: `${id} 不在信任集中` }
+    }
+    saveTrustFile(removeTrusted(file, id))
+    debugLog('trust remove via panel', { userId: id })
+    return { ok: true }
+  }
+
+  function trustSetMode(mode: string): { ok: boolean; error?: string } {
+    if (mode !== 'owner-only' && mode !== 'bootstrap' && mode !== 'manual') {
+      return { ok: false, error: '模式必须是 owner-only / bootstrap / manual' }
+    }
+    saveTrustFile(setTrustMode(loadTrustFile(), mode as TrustMode))
+    debugLog('trust mode set via panel', { mode })
+    return { ok: true }
+  }
+
+  function trustSetNotifyRejected(enabled: boolean): { ok: boolean } {
+    const config = readBridgeConfig()
+    config.notifyRejected = enabled
+    saveBridgeConfig(config)
+    debugLog('notifyRejected set via panel', { enabled })
+    return { ok: true }
   }
 
   // -------------------------------------------------------------------------
@@ -1232,6 +1396,71 @@ export function apply(ctx: Context, config: Config): void {
       },
     }))
 
+    // ---- 信任集管理（P1-2 / M4）----
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/trust',
+      handler: async (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, ...trustPayload() }))
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/trust/add',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req)
+          const result = trustAdd(String(body.userId || ''), typeof body.note === 'string' ? body.note : undefined)
+          res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ...result, ...trustPayload() }))
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }))
+        }
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/trust/remove',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req)
+          const result = trustRemove(String(body.userId || ''))
+          res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ...result, ...trustPayload() }))
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }))
+        }
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/trust/config',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req)
+          let result: { ok: boolean; error?: string } = { ok: true }
+          if (typeof body.mode === 'string') {
+            result = trustSetMode(body.mode)
+          }
+          if (result.ok && typeof body.notifyRejected === 'boolean') {
+            result = trustSetNotifyRejected(body.notifyRejected)
+          }
+          res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ...result, ...trustPayload() }))
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }))
+        }
+      },
+    }))
+
     return disposers
   }
 
@@ -1272,8 +1501,10 @@ export function apply(ctx: Context, config: Config): void {
   /**
    * Deliver a proactive notification to the bound WeChat account via the
    * daemon's throttled notify endpoint (daemon-port.json).
+   * 多用户（P1-2 / M3）：可指定目标用户（发起任务的微信用户本人）；
+   * 缺省时由 daemon 回退到最近活跃用户。
    */
-  async function sendWechatNotify(message: string): Promise<{ ok: boolean; message: string }> {
+  async function sendWechatNotify(message: string, userId?: string): Promise<{ ok: boolean; message: string }> {
     const portPath = join(dataDir, 'daemon-port.json')
     let info: { port?: number; token?: string } | null = null
     try {
@@ -1293,7 +1524,7 @@ export function apply(ctx: Context, config: Config): void {
           'Content-Type': 'application/json',
           'x-dsh-bridge-token': info.token,
         },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify(userId ? { message, userId } : { message }),
         signal: controller.signal,
       })
       clearTimeout(timer)
@@ -1321,8 +1552,9 @@ export function apply(ctx: Context, config: Config): void {
    * Push an urgent approval question to the bound WeChat account via the
    * daemon's direct (non-throttled) /approval endpoint. Resolves false when
    * the daemon is unreachable so callers can fall back to other answerers.
+   * 多用户：`key` 是审批归属的 session key，解出 userId 后把审批推给本人。
    */
-  async function pushApprovalMessage(message: string): Promise<boolean> {
+  async function pushApprovalMessage(message: string, key: string): Promise<boolean> {
     const portPath = join(dataDir, 'daemon-port.json')
     let info: { port?: number; token?: string } | null = null
     try {
@@ -1332,6 +1564,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (!info?.port || !info?.token) return false
     try {
+      const userId = userIdOfKey(key)
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), 10_000)
       const resp = await fetch(`http://127.0.0.1:${info.port}/approval`, {
@@ -1340,7 +1573,7 @@ export function apply(ctx: Context, config: Config): void {
           'Content-Type': 'application/json',
           'x-dsh-bridge-token': info.token,
         },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify(userId ? { message, userId } : { message }),
         signal: controller.signal,
       })
       clearTimeout(timer)
@@ -1540,8 +1773,11 @@ export function apply(ctx: Context, config: Config): void {
         message: { type: 'string', description: '要发送给微信的通知内容，简洁明确，避免模板化重复措辞。' },
       },
       output: simpleOutput,
-      execute: async (args: { message: string }) => {
-        const result = await sendWechatNotify(args.message)
+      execute: async (args: { message: string }, exec: { agent?: { session?: { id?: unknown } } }) => {
+        // 多用户：把通知推给发起当前任务的微信用户本人（解 agent → session key → userId）。
+        const key = accountIdForAgent(exec?.agent)
+        const userId = key ? userIdOfKey(key) : ''
+        const result = await sendWechatNotify(args.message, userId || undefined)
         if (!result.ok) throw new Error(result.message)
         return { ok: true, message: result.message }
       },
@@ -1553,6 +1789,9 @@ export function apply(ctx: Context, config: Config): void {
   // -------------------------------------------------------------------------
 
   ctx.effect(() => {
+    // 多用户迁移（幂等）：旧单用户 session-ids.json key → per-user key。
+    migrateSessionIdMap()
+
     const server = createServer((req, res) => {
       handleInternal(req, res).catch((err) => {
         const message = err instanceof Error ? err.message : String(err)

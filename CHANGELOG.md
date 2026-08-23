@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.6.0] - 2026-08-23
+
+### Added
+
+- **多用户支持（P1-2）**：信任集 + per-user 会话。对标 Kairos0922 的多用户能力，多个微信用户可与同一 bot 对话，每人独立会话/上下文/队列/审批归属，互不可见。
+  - **信任集**（`trust.json`，0600）：三种模式——`owner-only`（默认，行为与旧版完全一致）/ `bootstrap`（首个联系的陌生人自动入集，一次性）/ `manual`（仅 `/trust` 或面板显式添加）。
+  - 信任命令（仅 owner）：`/trust <userId> [备注]`、`/distrust <userId>`、`/trustlist`、`/trustmode [owner-only|bootstrap|manual]`。
+  - **per-user 会话隔离**：session key 统一为 `${botAccountId}::${userId}`；每个用户独立会话文件、DSH agent、消息队列（A 的长任务不再阻塞 B）、上下文 token、`/history` `/status` `/cwd` `/model`。
+  - **审批归属严格化**：`/yes` `/no` 只裁决自己 agent 的 pending（key = session key）；审批/主动通知推送按发起用户显式带 `userId`，推给本人而非固定 owner。
+  - **信任门禁前置**：优先命令（`/stop` `/clear` `/new`）与审批回复也走信任门禁，owner-only 下仍仅 owner；多用户下受信用户可停自己的任务/清自己的会话。
+  - **升级迁移（防丢数据）**：旧单用户 `sessions/<accountId>.json` → `sessions/<accountId>__<ownerUserId>.json`，`session-ids.json` 旧 key → `${accountId}::${ownerUserId}`；迁移只改名不重写，无法确定 owner 时保留原文件，全部留痕日志。
+  - **Web 面板信任用户区**：模式切换、陌生人提醒开关、信任列表（userId/备注/最近活跃/来源）+ 添加 + 吊销；`/trust` 等 4 条新 Web 路由（11 → 15）。
+  - `notifyRejected` 配置：陌生人尝试联系时向 owner 推提醒（默认关）。
+
+### Changed
+
+- 信任模式唯一真相源收口到 `trust.json`（不再与 config.json 双源漂移）。
+- `readBridgeConfig`/`saveBridgeConfig` 改为合并写回，不再抹掉 daemon 写入的 `usageFooter` 等字段。
+- 项目绑定两级粒度：面板选择 = 账号级（bot 下所有用户生效）；微信 `/session` = 用户级（仅本人）。
+- DSH 会话 ID 生成对 session key 做字符清洗（`:` → `-`），避免 Windows 文件系统非法字符。
+
+### Security
+
+- 多用户下 `/stop` `/clear` `/new` `/yes` `/no` 从「仅 owner」放宽为「任意受信用户但只作用于自己的会话」，归属不越权。
+
+### Fixed（发布前 code review）
+
+- `/trustmode` 文案纠正：切换实际立即生效（原写"重启桥接后生效"误导）；router 注释同步修正（trustMode 写入 trust.json 而非 config.json）。
+- **lastSeenAt 落盘**：`decideTrust` trusted 分支不再就地改 file，返回新对象；门禁对 lastSeenAt 刷新 60s 节流落盘——面板「最近活跃」与 `/trustlist` 重启后不再丢。
+- **notifyRejected 提醒走节流队列**：陌生人联系提醒经 notifyThrottle 发送（原来直接 sendText，多消息会撞 iLink 主动推送风控）。
+- **bootstrap 自动入集加 userId 形态校验**：异常字符（含 `::`/空格）直接拒绝不自动入集，避免后续 session key 构造抛错吞消息。
+- `context-tokens.json` / `context-token.json` 写入补 0600 权限（与 trust/config 对齐安全基线）。
+- 移除死字段 `CommandResult.trustChanged`（main 未消费）。
+- 单测隔离数据目录（设 `DSH_BRIDGE_DATA_DIR` 到临时目录），不再污染真实 `~/.dsh/wechat-bridge` 日志。
+
 ## [0.5.0] - 2026-08-21
 
 ### Added

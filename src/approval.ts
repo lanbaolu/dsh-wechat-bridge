@@ -27,8 +27,12 @@ export type ApprovalNext = () => Promise<ApprovalOutcome>
 export interface ApprovalManagerDeps {
   /** 审批等待超时（毫秒）。 */
   timeoutMs: number
-  /** 推送一条紧急消息到绑定的微信；daemon 不可达时 resolve false。 */
-  push: (text: string) => Promise<boolean>
+  /**
+   * 推送一条紧急消息到绑定的微信；daemon 不可达时 resolve false。
+   * `key` 是审批归属的 session key（多用户下 = ${botAccountId}::${userId}），
+   * 调用方据此把审批推给发起任务的用户本人。
+   */
+  push: (text: string, key: string) => Promise<boolean>
   log?: (message: string, data?: unknown) => void
 }
 
@@ -99,7 +103,7 @@ export function createApprovalManager(deps: ApprovalManagerDeps): ApprovalManage
         timer: setTimeout(() => {
           settle(accountId, entry, 'rejected')
           log('approval timed out, auto-rejected', { accountId, toolName: req.toolName })
-          void deps.push(`⏱ 审批超时，已自动拒绝：${req.toolName}`).catch(() => false)
+          void deps.push(`⏱ 审批超时，已自动拒绝：${req.toolName}`, accountId).catch(() => false)
         }, deps.timeoutMs),
       }
       // 请求方撤销（如任务被 /stop）：立即收敛，迟到回复不再有效。
@@ -112,7 +116,7 @@ export function createApprovalManager(deps: ApprovalManagerDeps): ApprovalManage
     })
     pending.set(accountId, entry)
 
-    const delivered = await deps.push(formatApprovalText(req, deps.timeoutMs)).catch(() => false)
+    const delivered = await deps.push(formatApprovalText(req, deps.timeoutMs), accountId).catch(() => false)
     if (!delivered) {
       // 推送失败：撤销 pending（清理定时器与信号监听）并交回瀑布下游。
       if (pending.get(accountId) === entry) pending.delete(accountId)
