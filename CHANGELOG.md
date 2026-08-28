@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0] - 2026-08-28
+
+### Added
+
+- **超时安抚配置化（issue #2）**：`config.json` 新增 `calm` 节——`enabled`（开关）/ `silenceMs`（首次静默，默认 5 分钟）/ `intervalMs`（重复间隔，默认同 silenceMs）/ `maxCount`（每轮上限，0 = 不限）/ `messages`（自定义文案，随机取一条）。Web 面板新增「⏳ 超时安抚」区块可视化配置（开关 + 分钟数 + 上限 + 文案编辑），并新增 `/config` 读写端点。保存后即时生效（最长延迟数秒），无需重启；全部缺省时行为与旧版完全一致。
+
+### Fixed
+
+- **面板深色主题文字不可读（PR #1）**：面板 CSS 变量映射到宿主真实 `--dsw-alias-*` 主题体系（保留 fallback 兼容非 DSH 宿主），深色主题下文字/按钮恢复可读，浅色主题无回归。
+- **daemon 在 DSH Desktop（Electron 宿主）下无法启动**：`spawn` 注入 `ELECTRON_RUN_AS_NODE=1`，避免 watchdog 每次拉起都启动一个 Electron 实例（表现为不停开新窗口、daemon 秒退循环）。
+
 ## [0.6.0] - 2026-08-23
 
 ### Added
