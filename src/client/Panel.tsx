@@ -4,7 +4,7 @@ import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-setti
 
 const API_BASE = '/@lanbaolu/dsh-wechat-bridge'
 
-const panelStyle: React.CSSProperties = {
+const panelStyle = {
   padding: '14px 16px',
   fontFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
   fontSize: 13,
@@ -14,7 +14,17 @@ const panelStyle: React.CSSProperties = {
   border: '1px solid var(--border-color, rgba(127,127,127,.18))',
   borderRadius: 10,
   margin: '8px 0',
-}
+  // DSH 宿主不使用 --text-1/--surface-2 等通用变量名（实际变量体系为 --dsw-alias-*），
+  // 导致深色主题下文字永远 fallback 到黑色 #1f2328，几乎不可读。
+  // 在面板根元素上把用到的变量映射到宿主真实变量，深浅主题自动跟随。
+  // @types/react 18 的 CSSProperties 不含 CSS 自定义属性键，故用交叉类型断言。
+  '--text-1': 'var(--dsw-alias-label-primary, #1f2328)',
+  '--surface-2': 'var(--dsw-alias-bg-module-platform, rgba(127,127,127,.06))',
+  '--surface-3': 'var(--dsw-alias-bg-layer-2, rgba(0,0,0,.04))',
+  '--border-color': 'var(--dsw-alias-border-l2, rgba(127,127,127,.18))',
+  '--button-bg': 'var(--dsw-alias-bg-layer-1, #fff)',
+} as React.CSSProperties &
+  Record<'--text-1' | '--surface-2' | '--surface-3' | '--border-color' | '--button-bg', string>
 
 const titleStyle: React.CSSProperties = {
   fontWeight: 600,
