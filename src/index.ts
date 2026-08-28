@@ -988,6 +988,11 @@ export function apply(ctx: Context, config: Config): void {
       cwd: dirname(script),
       env: {
         ...process.env,
+        // 宿主是 Electron（DSH Desktop）时 process.execPath 是 Electron 二进制：
+        // 必须用 ELECTRON_RUN_AS_NODE=1 让它以纯 Node 模式执行 daemon 脚本，
+        // 否则每次拉起都会启动一个 Electron 实例（窗口闪现后秒退，watchdog 无限循环）。
+        // 纯 node 宿主（npx dsh web）下该变量无害。
+        ELECTRON_RUN_AS_NODE: '1',
         DSH_HOME: dshHome,
         DSH_BRIDGE_DATA_DIR: dataDir,
         DSH_BRIDGE_API_BASE: `http://127.0.0.1:${internalPort}`,
