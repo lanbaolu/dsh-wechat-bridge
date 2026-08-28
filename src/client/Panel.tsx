@@ -135,6 +135,43 @@ const TRUST_MODE_LABELS: Record<TrustInfo['mode'], string> = {
   manual: '仅手动添加的人',
 }
 
+/** 超时安抚配置的面板编辑态（分钟用字符串便于输入，保存时转换）。 */
+interface CalmUiState {
+  enabled: boolean
+  silenceMin: string
+  intervalMin: string
+  maxCount: string
+  messages: string
+}
+
+const CALM_DEFAULTS: CalmUiState = { enabled: true, silenceMin: '5', intervalMin: '5', maxCount: '0', messages: '' }
+
+function calmFromConfig(calm?: { enabled?: boolean; silenceMs?: number; intervalMs?: number; maxCount?: number; messages?: string[] }): CalmUiState {
+  return {
+    enabled: calm?.enabled !== false,
+    silenceMin: calm?.silenceMs && calm.silenceMs > 0 ? String(Math.round(calm.silenceMs / 60000)) : '5',
+    intervalMin: calm?.intervalMs && calm.intervalMs > 0 ? String(Math.round(calm.intervalMs / 60000)) : '5',
+    maxCount: calm?.maxCount !== undefined ? String(calm.maxCount) : '0',
+    messages: calm?.messages?.length ? calm.messages.join('\n') : '',
+  }
+}
+
+function calmToConfig(ui: CalmUiState): { enabled: boolean; silenceMs?: number; intervalMs?: number; maxCount?: number; messages?: string[] } {
+  const toMin = (v: string): number | undefined => {
+    const n = Number(v)
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 60000) : undefined
+  }
+  const maxCount = Number(ui.maxCount)
+  const messages = ui.messages.split('\n').map((s) => s.trim()).filter(Boolean)
+  return {
+    enabled: ui.enabled,
+    silenceMs: toMin(ui.silenceMin),
+    intervalMs: toMin(ui.intervalMin),
+    maxCount: Number.isFinite(maxCount) && maxCount >= 0 ? Math.round(maxCount) : undefined,
+    messages: messages.length > 0 ? messages : undefined,
+  }
+}
+
 function formatTime(ms?: number): string {
   if (!ms) return '从未活跃'
   try {
@@ -162,6 +199,10 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
   const [projectMessage, setProjectMessage] = useState('')
   const [projectError, setProjectError] = useState('')
   const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null)
+  const [calm, setCalm] = useState<CalmUiState>(CALM_DEFAULTS)
+  const [calmBusy, setCalmBusy] = useState(false)
+  const [calmMessage, setCalmMessage] = useState('')
+  const [calmError, setCalmError] = useState('')
   const [trust, setTrust] = useState<TrustInfo | null>(null)
   const [trustBusy, setTrustBusy] = useState(false)
   const [trustMessage, setTrustMessage] = useState('')
@@ -210,7 +251,41 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
     } catch {
       // ignore
     }
+    // 桥接配置（超时安抚等）单独拉取，避免被初次渲染的默认值覆盖
+    try {
+      const cfgRes = await fetch(`${API_BASE}/config`, { cache: 'no-store' })
+      if (cfgRes.ok) {
+        const cfgData = await cfgRes.json()
+        if (cfgData && typeof cfgData === 'object' && cfgData.ok) {
+          setCalm(calmFromConfig(cfgData.calm))
+        }
+      }
+    } catch {
+      // ignore
+    }
   }, [])
+
+  async function saveCalm(): Promise<void> {
+    setCalmBusy(true)
+    setCalmError('')
+    setCalmMessage('')
+    try {
+      const res = await fetch(`${API_BASE}/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ calm: calmToConfig(calm) }),
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || `HTTP ${res.status}`)
+      }
+      setCalmMessage('已保存，下次安抚时生效（最长延迟数秒）。')
+    } catch (err) {
+      setCalmError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setCalmBusy(false)
+    }
+  }
 
   useEffect(() => {
     void refresh()
@@ -497,6 +572,77 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
         ) : (
           <div style={{ fontSize: 12, opacity: 0.7 }}>守护进程未运行，暂无数据。</div>
         )}
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ ...titleStyle, marginBottom: 4 }}>⏳ 超时安抚</div>
+        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
+          DSH 长时间没有产出消息时，主动发一条"还在处理"的安抚消息。改配置后即时生效（最长延迟数秒）。
+        </div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, marginBottom: 8 }}>
+          <input
+            type="checkbox"
+            checked={calm.enabled}
+            onChange={(e) => setCalm((c) => ({ ...c, enabled: e.target.checked }))}
+          />
+          启用安抚消息
+        </label>
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
+          <label style={{ fontSize: 12 }}>
+            首次静默（分钟）
+            <input
+              type="number"
+              min={1}
+              value={calm.silenceMin}
+              onChange={(e) => setCalm((c) => ({ ...c, silenceMin: e.target.value }))}
+              style={{ ...inputStyle, marginLeft: 6, minWidth: 70 }}
+            />
+          </label>
+          <label style={{ fontSize: 12 }}>
+            重复间隔（分钟）
+            <input
+              type="number"
+              min={1}
+              value={calm.intervalMin}
+              onChange={(e) => setCalm((c) => ({ ...c, intervalMin: e.target.value }))}
+              style={{ ...inputStyle, marginLeft: 6, minWidth: 70 }}
+            />
+          </label>
+          <label style={{ fontSize: 12 }}>
+            每轮上限（次，0=不限）
+            <input
+              type="number"
+              min={0}
+              value={calm.maxCount}
+              onChange={(e) => setCalm((c) => ({ ...c, maxCount: e.target.value }))}
+              style={{ ...inputStyle, marginLeft: 6, minWidth: 70 }}
+            />
+          </label>
+        </div>
+        <label style={{ fontSize: 12, display: 'block', marginBottom: 6 }}>
+          自定义文案（每行一条，留空用内置默认；每次随机取一条）
+          <textarea
+            value={calm.messages}
+            onChange={(e) => setCalm((c) => ({ ...c, messages: e.target.value }))}
+            rows={3}
+            style={{
+              ...inputStyle,
+              display: 'block',
+              marginTop: 4,
+              minWidth: '100%',
+              boxSizing: 'border-box',
+              resize: 'vertical',
+              fontFamily: 'inherit',
+            }}
+          />
+        </label>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <button type="button" style={buttonStyle} disabled={calmBusy} onClick={() => void saveCalm()}>
+            保存安抚设置
+          </button>
+          {calmMessage && <span role="status" style={{ color: '#2f9e44', fontSize: 12 }}>{calmMessage}</span>}
+          {calmError && <span role="alert" style={{ color: '#e5484d', fontSize: 12 }}>{calmError}</span>}
+        </div>
       </div>
 
       <div style={{ marginBottom: 12 }}>

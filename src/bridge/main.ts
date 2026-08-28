@@ -14,7 +14,7 @@ import { createSender } from './wechat/send.js';
 import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, downloadFile } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
-import { loadConfig, saveConfig } from './config.js';
+import { loadConfig, saveConfig, type CalmConfig } from './config.js';
 import { loadJson, saveJson } from './store.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
@@ -997,13 +997,35 @@ async function sendToDsh(
       }
     }, BATCH_TICK_MS);
 
-    // 超时安抚：如果 5 分钟没有产出任何消息，主动告诉用户还在处理。
-    const SILENCE_WARNING_MS = 5 * 60 * 1000;
+    // 超时安抚：如果静默太久没有产出任何消息，主动告诉用户还在处理。
+    // 行为可在 config.json 的 calm 节配置（enabled / silenceMs / intervalMs / maxCount / messages），
+    // 每次发送前动态读取最新配置，保存后即时生效（最多延迟一个轮询周期）。
+    const DEFAULT_SILENCE_MS = 5 * 60 * 1000;
+    const DEFAULT_CALM_MESSAGES = SILENCE_MESSAGES;
+    let calmSentCount = 0;
+    let calmCfgCache: CalmConfig | undefined;
+    let calmCfgLoadedAt = 0;
+    const currentCalmConfig = (): CalmConfig => {
+      const now = Date.now();
+      if (now - calmCfgLoadedAt > 10_000) {
+        calmCfgCache = loadConfig().calm ?? {};
+        calmCfgLoadedAt = now;
+      }
+      return calmCfgCache!;
+    };
     keepaliveTimer = setInterval(() => {
-      if (Date.now() - lastSentTime > SILENCE_WARNING_MS) {
-        const msg = SILENCE_MESSAGES[Math.floor(Math.random() * SILENCE_MESSAGES.length)];
+      const calm = currentCalmConfig();
+      if (calm.enabled === false) return;
+      if (calm.maxCount && calmSentCount >= calm.maxCount) return;
+      const silenceMs = calm.silenceMs && calm.silenceMs > 0 ? calm.silenceMs : DEFAULT_SILENCE_MS;
+      const intervalMs = calm.intervalMs && calm.intervalMs > 0 ? calm.intervalMs : silenceMs;
+      const waitMs = calmSentCount === 0 ? silenceMs : intervalMs;
+      if (Date.now() - lastSentTime > waitMs) {
+        const pool = calm.messages && calm.messages.length > 0 ? calm.messages : DEFAULT_CALM_MESSAGES;
+        const msg = pool[Math.floor(Math.random() * pool.length)];
         sender.sendText(fromUserId, contextToken, msg).catch(() => {});
         lastSentTime = Date.now();
+        calmSentCount += 1;
       }
     }, 2000);
 

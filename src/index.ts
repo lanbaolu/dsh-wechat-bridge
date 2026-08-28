@@ -36,6 +36,7 @@ import { loadJson, saveJson, validateAccountId } from './bridge/store.js'
 import type { NotifyStatus } from './bridge/notify.js'
 import { loadTrust, saveTrust, addTrusted, removeTrusted, setTrustMode, listTrusted, isPlausibleUserId, type TrustFile, type TrustMode } from './bridge/trust.js'
 import { parseSessionKey } from './bridge/session-key.js'
+import { parseCalmConfig } from './bridge/config.js'
 
 export const name = '@lanbaolu/dsh-wechat-bridge'
 
@@ -1054,19 +1055,23 @@ export function apply(ctx: Context, config: Config): void {
     return join(dataDir, 'config.json')
   }
 
-  function readBridgeConfig(): { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean } {
+  function readBridgeConfig(): { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean; usageFooter?: boolean; calm?: import('./bridge/config.js').CalmConfig } {
     try {
       const raw = JSON.parse(readFileSync(bridgeConfigPath(), 'utf8')) as {
         workingDirectory?: string
         model?: string
         systemPrompt?: string
         notifyRejected?: boolean | string
+        usageFooter?: boolean | string
+        calm?: import('./bridge/config.js').CalmConfig
       }
       return {
         workingDirectory: raw.workingDirectory || join(homedir(), 'Documents', 'DSH'),
         model: raw.model,
         systemPrompt: raw.systemPrompt,
         notifyRejected: raw.notifyRejected === true || raw.notifyRejected === 'true',
+        usageFooter: raw.usageFooter === undefined ? undefined : (raw.usageFooter === true || raw.usageFooter === 'true'),
+        calm: raw.calm && typeof raw.calm === 'object' ? raw.calm : undefined,
       }
     } catch {
       return {
@@ -1075,7 +1080,7 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  function saveBridgeConfig(config: { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean }): void {
+  function saveBridgeConfig(config: { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean; calm?: import('./bridge/config.js').CalmConfig }): void {
     mkdirSync(dataDir, { recursive: true })
     // 合并写回：不覆盖 daemon 侧写入的其他字段（如 usageFooter）。
     let existing: Record<string, unknown> = {}
@@ -1092,6 +1097,7 @@ export function apply(ctx: Context, config: Config): void {
     if (config.model) data.model = config.model
     if (config.systemPrompt) data.systemPrompt = config.systemPrompt
     if (config.notifyRejected !== undefined) data.notifyRejected = config.notifyRejected
+    if (config.calm !== undefined) data.calm = config.calm
     writeFileSync(bridgeConfigPath(), JSON.stringify(data, null, 2) + '\n', 'utf8')
     if (process.platform !== 'win32') {
       chmodSync(bridgeConfigPath(), 0o600)
@@ -1454,6 +1460,53 @@ export function apply(ctx: Context, config: Config): void {
           }
           res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ ...result, ...trustPayload() }))
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }))
+        }
+      },
+    }))
+
+    // 桥接配置读写（面板「超时安抚」等设置）：GET 读全部配置，POST 按字段合并写回。
+    // config.json 由 host 与 daemon 共享，写盘后 daemon 侧最多延迟一个轮询周期生效。
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/config',
+      handler: async (req, res) => {
+        try {
+          if (req.method === 'GET' || req.method === undefined) {
+            const config = readBridgeConfig()
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({
+              ok: true,
+              workingDirectory: config.workingDirectory,
+              model: config.model ?? null,
+              usageFooter: config.usageFooter ?? undefined,
+              notifyRejected: config.notifyRejected ?? false,
+              calm: config.calm ?? {},
+            }))
+            return
+          }
+          if (req.method === 'POST') {
+            const body = await readBody(req)
+            const config = readBridgeConfig()
+            if (body.calm !== undefined) {
+              if (!body.calm || typeof body.calm !== 'object') {
+                res.writeHead(400, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ ok: false, error: 'calm 必须是对象' }))
+                return
+              }
+              // 写盘前清洗（非法字段丢弃），daemon 读取时还会再兜底一次。
+              const parsed = parseCalmConfig(body.calm)
+              config.calm = parsed ?? {}
+            }
+            saveBridgeConfig(config)
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, calm: config.calm ?? {} }))
+            return
+          }
+          res.writeHead(405, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: 'method not allowed' }))
         } catch (err) {
           res.writeHead(400, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }))
