@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline';
 import process from 'node:process';
@@ -29,6 +30,44 @@ import { loadTrust, saveTrust, decideTrust, setTrustMode } from './trust.js';
 // ---------------------------------------------------------------------------
 
 const MAX_MESSAGE_LENGTH = 4000;
+
+/**
+ * 防休眠抑制器（config.preventSleep=true 时由 runDaemon 启停）：
+ * daemon 运行期间抑制系统休眠，锁屏/合盖不挂起，微信消息持续响应。
+ * macOS=caffeinate；Linux=systemd-inhibit；Windows=SetThreadExecutionState 持续刷新。
+ */
+let sleepGuard: ChildProcess | null = null;
+function sleepGuardCommand(): { cmd: string; args: string[] } | null {
+  if (process.platform === 'darwin') return { cmd: 'caffeinate', args: ['-dimsu'] };
+  if (process.platform === 'linux') return { cmd: 'systemd-inhibit', args: ['--what=sleep', '--mode=block', '--', 'sleep', 'infinity'] };
+  if (process.platform === 'win32') {
+    return {
+      cmd: 'powershell.exe',
+      args: ['-NoProfile', '-Command', '$s="[DllImport(\\"kernel32.dll\\")] public static extern uint SetThreadExecutionState(uint f);";$t=Add-Type -MemberDefinition $s -Name P -Namespace W -PassThru;while($true){$t::SetThreadExecutionState(0x80000002)|Out-Null;Start-Sleep 60}'],
+    };
+  }
+  return null;
+}
+function startSleepGuard(): void {
+  if (sleepGuard) return;
+  const cmd = sleepGuardCommand();
+  if (!cmd) return; // 平台无方案则静默（不改变系统电源行为）
+  try {
+    sleepGuard = spawn(cmd.cmd, cmd.args, { stdio: 'ignore', windowsHide: true });
+    sleepGuard.on('error', () => { sleepGuard = null; });
+    logger.info('Sleep guard started', { platform: process.platform, cmd: cmd.cmd });
+  } catch (err) {
+    logger.warn('Sleep guard failed to start', { error: err instanceof Error ? err.message : String(err) });
+    sleepGuard = null;
+  }
+}
+function stopSleepGuard(): void {
+  if (sleepGuard) {
+    try { sleepGuard.kill(); } catch { /* ignore */ }
+    sleepGuard = null;
+    logger.info('Sleep guard stopped');
+  }
+}
 
 /**
  * Most recent WeChat user the daemon talked to (the bound user).
@@ -440,6 +479,11 @@ async function runDaemon(): Promise<void> {
   // 守卫后 account 必非 null；闭包（信任门禁等）拿不到收窄，这里显式声明非空。
   const account: AccountData = loadedAccount;
 
+  // 防休眠（config.preventSleep=true 时开启）：daemon 运行期间抑制系统休眠。
+  if (config.preventSleep === true) {
+    startSleepGuard();
+  }
+
   const apiBase = process.env.DSH_BRIDGE_API_BASE;
   const apiToken = process.env.DSH_BRIDGE_API_TOKEN;
   if (!apiBase || !apiToken) {
@@ -770,6 +814,7 @@ async function runDaemon(): Promise<void> {
 
   function shutdown(): void {
     logger.info('Shutting down...');
+    stopSleepGuard();
     monitor.stop();
     notifyServer.close();
     notifyThrottle.stop();

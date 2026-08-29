@@ -16,6 +16,11 @@ export interface Config {
   notifyRejected?: boolean;
   /** 超时安抚消息配置（见 CalmConfig）。缺省时保持内置行为：5 分钟静默后每 5 分钟安抚一次。 */
   calm?: CalmConfig;
+  /**
+   * 是否在守护进程运行期间抑制系统休眠（锁屏/合盖不挂起，微信消息持续响应）。
+   * 默认 false（不改变系统电源行为）；开启后 macOS 用 caffeinate、Linux 用 systemd-inhibit。
+   */
+  preventSleep?: boolean;
 }
 
 /**
@@ -52,6 +57,7 @@ export function loadConfig(): Config {
       usageFooter: parsed.usageFooter === undefined ? undefined : (parsed.usageFooter === true || parsed.usageFooter === 'true'),
       notifyRejected: parsed.notifyRejected === undefined ? undefined : (parsed.notifyRejected === true || parsed.notifyRejected === 'true'),
       calm: parseCalmConfig(parsed.calm),
+      preventSleep: parsed.preventSleep === undefined ? undefined : (parsed.preventSleep === true || parsed.preventSleep === 'true'),
     };
     mkdirSync(config.workingDirectory, { recursive: true });
     return config;
@@ -94,6 +100,7 @@ export function saveConfig(config: Config): void {
   if (config.usageFooter !== undefined) data.usageFooter = config.usageFooter;
   if (config.notifyRejected !== undefined) data.notifyRejected = config.notifyRejected;
   if (config.calm !== undefined) data.calm = config.calm;
+  if (config.preventSleep !== undefined) data.preventSleep = config.preventSleep;
   writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2) + "\n", "utf-8");
   if (process.platform !== "win32") {
     chmodSync(CONFIG_PATH, 0o600);

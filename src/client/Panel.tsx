@@ -200,6 +200,7 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
   const [projectError, setProjectError] = useState('')
   const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null)
   const [calm, setCalm] = useState<CalmUiState>(CALM_DEFAULTS)
+  const [preventSleep, setPreventSleep] = useState(false)
   const [calmBusy, setCalmBusy] = useState(false)
   const [calmMessage, setCalmMessage] = useState('')
   const [calmError, setCalmError] = useState('')
@@ -258,12 +259,37 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
         const cfgData = await cfgRes.json()
         if (cfgData && typeof cfgData === 'object' && cfgData.ok) {
           setCalm(calmFromConfig(cfgData.calm))
+          setPreventSleep(cfgData.preventSleep === true)
         }
       }
     } catch {
       // ignore
     }
   }, [])
+
+  async function changePreventSleep(enabled: boolean): Promise<void> {
+    setCalmBusy(true)
+    setCalmError('')
+    setCalmMessage('')
+    try {
+      const res = await fetch(`${API_BASE}/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ preventSleep: enabled }),
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || `HTTP ${res.status}`)
+      }
+      setPreventSleep(enabled)
+      setCalmMessage(enabled ? '已开启防休眠：守护进程运行期间抑制系统休眠，重启 daemon 后生效。' : '已关闭防休眠。')
+    } catch (err) {
+      setCalmError(err instanceof Error ? err.message : String(err))
+      setPreventSleep(!enabled)
+    } finally {
+      setCalmBusy(false)
+    }
+  }
 
   async function saveCalm(): Promise<void> {
     setCalmBusy(true)
@@ -643,6 +669,22 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
           {calmMessage && <span role="status" style={{ color: '#2f9e44', fontSize: 12 }}>{calmMessage}</span>}
           {calmError && <span role="alert" style={{ color: '#e5484d', fontSize: 12 }}>{calmError}</span>}
         </div>
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ ...titleStyle, marginBottom: 4 }}>💤 防休眠</div>
+        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
+          守护进程运行期间抑制系统休眠（锁屏/合盖不挂起，微信消息持续响应）。macOS 用 caffeinate、Linux 用 systemd-inhibit、Windows 尽力而为。
+        </div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+          <input
+            type="checkbox"
+            checked={preventSleep}
+            disabled={calmBusy}
+            onChange={(e) => void changePreventSleep(e.target.checked)}
+          />
+          启用防休眠（重启守护进程后生效）
+        </label>
       </div>
 
       <div style={{ marginBottom: 12 }}>

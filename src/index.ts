@@ -1063,7 +1063,7 @@ export function apply(ctx: Context, config: Config): void {
     return join(dataDir, 'config.json')
   }
 
-  function readBridgeConfig(): { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean; usageFooter?: boolean; calm?: import('./bridge/config.js').CalmConfig } {
+  function readBridgeConfig(): { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean; usageFooter?: boolean; preventSleep?: boolean; calm?: import('./bridge/config.js').CalmConfig } {
     try {
       const raw = JSON.parse(readFileSync(bridgeConfigPath(), 'utf8')) as {
         workingDirectory?: string
@@ -1071,6 +1071,7 @@ export function apply(ctx: Context, config: Config): void {
         systemPrompt?: string
         notifyRejected?: boolean | string
         usageFooter?: boolean | string
+        preventSleep?: boolean | string
         calm?: import('./bridge/config.js').CalmConfig
       }
       return {
@@ -1079,6 +1080,7 @@ export function apply(ctx: Context, config: Config): void {
         systemPrompt: raw.systemPrompt,
         notifyRejected: raw.notifyRejected === true || raw.notifyRejected === 'true',
         usageFooter: raw.usageFooter === undefined ? undefined : (raw.usageFooter === true || raw.usageFooter === 'true'),
+        preventSleep: raw.preventSleep === undefined ? undefined : (raw.preventSleep === true || raw.preventSleep === 'true'),
         calm: raw.calm && typeof raw.calm === 'object' ? raw.calm : undefined,
       }
     } catch {
@@ -1088,7 +1090,7 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  function saveBridgeConfig(config: { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean; calm?: import('./bridge/config.js').CalmConfig }): void {
+  function saveBridgeConfig(config: { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean; usageFooter?: boolean; preventSleep?: boolean; calm?: import('./bridge/config.js').CalmConfig }): void {
     mkdirSync(dataDir, { recursive: true })
     // 合并写回：不覆盖 daemon 侧写入的其他字段（如 usageFooter）。
     let existing: Record<string, unknown> = {}
@@ -1106,6 +1108,7 @@ export function apply(ctx: Context, config: Config): void {
     if (config.systemPrompt) data.systemPrompt = config.systemPrompt
     if (config.notifyRejected !== undefined) data.notifyRejected = config.notifyRejected
     if (config.calm !== undefined) data.calm = config.calm
+    if (config.preventSleep !== undefined) data.preventSleep = config.preventSleep
     writeFileSync(bridgeConfigPath(), JSON.stringify(data, null, 2) + '\n', 'utf8')
     if (process.platform !== 'win32') {
       chmodSync(bridgeConfigPath(), 0o600)
@@ -1502,6 +1505,7 @@ export function apply(ctx: Context, config: Config): void {
               model: config.model ?? null,
               usageFooter: config.usageFooter ?? undefined,
               notifyRejected: config.notifyRejected ?? false,
+              preventSleep: config.preventSleep ?? false,
               calm: config.calm ?? {},
             }))
             return
@@ -1519,9 +1523,12 @@ export function apply(ctx: Context, config: Config): void {
               const parsed = parseCalmConfig(body.calm)
               config.calm = parsed ?? {}
             }
+            if (typeof body.preventSleep === 'boolean') {
+              config.preventSleep = body.preventSleep
+            }
             saveBridgeConfig(config)
             res.writeHead(200, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify({ ok: true, calm: config.calm ?? {} }))
+            res.end(JSON.stringify({ ok: true, calm: config.calm ?? {}, preventSleep: config.preventSleep ?? false }))
             return
           }
           res.writeHead(405, { 'Content-Type': 'application/json' })
