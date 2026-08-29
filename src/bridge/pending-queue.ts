@@ -7,6 +7,8 @@ export interface PendingItem {
   text: string;
   role: 'interstitial' | 'final';
   queuedAt: number;
+  /** 目标微信用户（多用户下区分补发给谁；缺省回退 owner）。 */
+  userId?: string;
 }
 
 const QUEUE_DIR = join(DATA_DIR, 'pending-queue');

@@ -19,7 +19,7 @@ import { loadJson, saveJson } from './store.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
-import { loadPendingQueue, savePendingQueue, type PendingItem } from './pending-queue.js';
+import { loadPendingQueue, savePendingQueue, appendPending, type PendingItem } from './pending-queue.js';
 import { DshClient, type DshStreamEvent } from './dsh-client.js';
 import { createNotifyThrottle } from './notify.js';
 import { loadTrust, saveTrust, decideTrust, setTrustMode } from './trust.js';
@@ -740,6 +740,32 @@ async function runDaemon(): Promise<void> {
   const lockTimer = setInterval(writePollLock, 30_000);
   lockTimer.unref?.();
 
+  // 发送失败暂存重试（pending-queue）：daemon 启动即补发一次 + 每 5 分钟重试，
+  // 直到发完。补偿"发送失败在 daemon 退出后丢失"的崩溃窗口。
+  async function flushPendingQueue(): Promise<void> {
+    const items = loadPendingQueue(account.accountId);
+    if (items.length === 0) return;
+    const remaining: PendingItem[] = [];
+    for (const item of items) {
+      if (item.role !== 'final') continue;
+      try {
+        const target = item.userId || account.userId || '';
+        await sender.sendText(target, contextTokenFor(target), item.text);
+        logger.info('Pending queue item delivered', { accountId: account.accountId, target });
+      } catch (err) {
+        logger.warn('Pending queue delivery failed, keep for retry', {
+          accountId: account.accountId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        remaining.push(item);
+      }
+    }
+    savePendingQueue(account.accountId, remaining);
+  }
+  const pendingRetryTimer = setInterval(() => { void flushPendingQueue().catch(() => {}); }, 5 * 60 * 1000);
+  pendingRetryTimer.unref?.();
+  void flushPendingQueue().catch(() => {});
+
   const monitor = createMonitor(api, callbacks);
 
   function shutdown(): void {
@@ -1072,6 +1098,23 @@ async function sendToDsh(
     }
 
     await flush();
+
+    // 崩溃安全：整轮结束仍未发出的缓冲落 pending-queue（daemon 重启/定时补发），
+    // 否则发送失败在 daemon 退出后永久丢失（用户收不到完整回复）。
+    if (pendingSend) {
+      appendPending(account.accountId, {
+        text: pendingSend,
+        role: 'final',
+        queuedAt: Date.now(),
+        userId: fromUserId,
+      });
+      logger.info('Final buffer persisted to pending queue', {
+        accountId: account.accountId,
+        chars: pendingSend.length,
+        userId: fromUserId,
+      });
+      pendingSend = '';
+    }
 
     const resultText = finalText.trim();
     if (resultText) {
