@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.1] - 2026-08-29
+
+### Fixed
+
+- **扫码重绑后面板报「HTTP 400」**：扫码确认 → `restartDaemon` → `stopDaemon` kill 旧 daemon 后 `await 500ms` 期间，daemon 退出事件（`child.on('exit')`）把 `bridgeChild` 清成 `undefined`，随后访问 `bridgeChild.exitCode` 抛 TypeError，且 `setup/start`、`setup/status` 端点 handler 无 try/catch，异常冒泡到宿主 web server 变成裸 HTTP 400。修复：`stopDaemon` 改局部 `child` 引用（await 后仍可读 `exitCode`）；两个 setup 端点 handler 加 try/catch，内部错误返回结构化 JSON（面板显示具体原因而非状态码）。
+
 ## [0.7.0] - 2026-08-28
 
 ### Added
