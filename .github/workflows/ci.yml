@@ -34,3 +34,6 @@ jobs:
 
       - name: Build client
         run: npm run build:client
+
+      - name: Run unit tests
+        run: node tests/session-key.test.cjs && node tests/trust.test.cjs
