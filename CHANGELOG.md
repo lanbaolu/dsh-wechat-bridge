@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0] - 2026-08-29
+
+### Added
+
+- **发送失败补发闭环（pending-queue 接入）**：整轮流式发送结束仍未能发出的缓冲会落盘暂存（`pending-queue/<accountId>.json`，带 `userId` 区分多用户目标），daemon 启动即补发一次 + 每 5 分钟重试，发送成功才移除，失败保留下轮再试——发送失败不再因 daemon 退出而永久丢失。
+- **防休眠（preventSleep）**：config.json 新增 `preventSleep`（默认关）。开启后 daemon 运行期间抑制系统休眠，锁屏/合盖不挂起、微信消息持续响应；macOS `caffeinate` / Linux `systemd-inhibit` / Windows `SetThreadExecutionState`（尽力而为）。面板新增「💤 防休眠」开关，重启 daemon 生效。
+
+### Changed
+
+- **单测纳入 CI**：`.github/workflows/ci.yml` build 后运行 `tests/session-key.test.cjs` + `tests/trust.test.cjs`（39 项断言），回归有保障。
+- 发展方向方案存档 `docs/future-plan.md`（P0/P1/P2 分期）。
+
 ## [0.7.1] - 2026-08-29
 
 ### Fixed
