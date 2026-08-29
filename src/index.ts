@@ -1029,10 +1029,13 @@ export function apply(ctx: Context, config: Config): void {
   async function stopDaemon(): Promise<{ ok: boolean; message: string }> {
     const pid = daemonPid()
     if (bridgeChild && bridgeChild.pid !== undefined && bridgeChild.exitCode === null) {
-      bridgeChild.kill()
+      // 局部引用：await 期间 daemon 退出会触发 child.on('exit') 把 bridgeChild 清成
+      // undefined，后续访问 bridgeChild.exitCode 会抛 TypeError（扫码重绑时曾出现）。
+      const child = bridgeChild
+      child.kill()
       await new Promise(r => setTimeout(r, 500))
-      if (bridgeChild.exitCode === null) {
-        bridgeChild.kill('SIGKILL')
+      if (child.exitCode === null) {
+        child.kill('SIGKILL')
       }
     } else if (pid) {
       try {
@@ -1382,16 +1385,22 @@ export function apply(ctx: Context, config: Config): void {
       kind: 'exact',
       path: '/@lanbaolu/dsh-wechat-bridge/setup/start',
       handler: async (req, res) => {
-        let workingDirectory: string | undefined
         try {
-          const body = await readBody(req)
-          workingDirectory = typeof body.workingDirectory === 'string' ? body.workingDirectory : undefined
-        } catch {
-          // body optional
+          let workingDirectory: string | undefined
+          try {
+            const body = await readBody(req)
+            workingDirectory = typeof body.workingDirectory === 'string' ? body.workingDirectory : undefined
+          } catch {
+            // body optional
+          }
+          const result = await startSetup(workingDirectory)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(result))
+        } catch (err) {
+          // 不让异常冒泡到宿主 web server（会变成裸 HTTP 400，面板只能显示状态码）。
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, status: 'error', message: err instanceof Error ? err.message : String(err), retryable: false }))
         }
-        const result = await startSetup(workingDirectory)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(result))
       },
     }))
 
@@ -1399,11 +1408,16 @@ export function apply(ctx: Context, config: Config): void {
       kind: 'exact',
       path: '/@lanbaolu/dsh-wechat-bridge/setup/status',
       handler: async (req, res) => {
-        const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`)
-        const qrcodeId = url.searchParams.get('qrcodeId') || ''
-        const result = await checkSetupStatus(qrcodeId)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(result))
+        try {
+          const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`)
+          const qrcodeId = url.searchParams.get('qrcodeId') || ''
+          const result = await checkSetupStatus(qrcodeId)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(result))
+        } catch (err) {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, status: 'error', message: err instanceof Error ? err.message : String(err), retryable: false }))
+        }
       },
     }))
 
