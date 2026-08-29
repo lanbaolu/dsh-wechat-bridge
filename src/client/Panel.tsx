@@ -85,6 +85,24 @@ const hintStyle: React.CSSProperties = {
   opacity: 0.7,
 }
 
+/** 折叠分组：把面板拆成可收起的区块，降低设置页复杂度。 */
+function Section({ title, defaultOpen = false, children }: { title: string; defaultOpen?: boolean; children: React.ReactNode }) {
+  return (
+    <details
+      open={defaultOpen}
+      style={{
+        marginBottom: 10,
+        border: '1px solid var(--border-color, rgba(127,127,127,.18))',
+        borderRadius: 8,
+        padding: '8px 10px',
+      }}
+    >
+      <summary style={{ fontWeight: 600, fontSize: 13, cursor: 'pointer', userSelect: 'none' }}>{title}</summary>
+      <div style={{ marginTop: 8 }}>{children}</div>
+    </details>
+  )
+}
+
 type SetupPhase = 'idle' | 'starting' | 'qr' | 'confirmed' | 'error'
 
 interface ProjectSessionItem {
@@ -550,16 +568,37 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
 
       {error && <div role="alert" style={{ color: '#e5484d', marginBottom: 8 }}>{error}</div>}
 
-      <label style={{ display: 'block', marginBottom: 8, fontSize: 12 }}>
-        DSH 工作目录
-        <input
-          type="text"
-          value={workingDir}
-          onChange={(e) => setWorkingDir(e.target.value)}
-          placeholder="例如 ~/Documents/DSH"
-          style={{ ...inputStyle, marginLeft: 8 }}
-        />
-      </label>
+      <Section title="⚙️ 状态与操作" defaultOpen>
+        <div style={buttonRowStyle}>
+          {actions.map((action) => (
+            <button
+              key={action.label}
+              type="button"
+              style={buttonStyle}
+              disabled={action.disabled ?? false}
+              onClick={action.run}
+            >
+              {action.label}
+            </button>
+          ))}
+        </div>
+        <details style={{ marginTop: 8 }}>
+          <summary style={{ fontSize: 12, opacity: 0.7, cursor: 'pointer' }}>状态 / 日志输出</summary>
+          <pre style={{ ...outputStyle, marginTop: 6 }} aria-live="polite">{output}</pre>
+        </details>
+      </Section>
+
+      <Section title="🔗 连接与账号">
+        <label style={{ display: 'block', marginBottom: 8, fontSize: 12 }}>
+          DSH 工作目录
+          <input
+            type="text"
+            value={workingDir}
+            onChange={(e) => setWorkingDir(e.target.value)}
+            placeholder="例如 ~/Documents/DSH"
+            style={{ ...inputStyle, marginLeft: 8 }}
+          />
+        </label>
 
       <div style={{ marginBottom: 12 }}>
         <div style={{ ...titleStyle, marginBottom: 4 }}>项目对话绑定</div>
@@ -595,8 +634,10 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
         {projectError && (
           <div role="alert" style={{ color: '#e5484d', marginTop: 6, fontSize: 12 }}>{projectError}</div>
         )}
-      </div>
+        </div>
+      </Section>
 
+      <Section title="💬 消息与通知">
       <div style={{ marginBottom: 12 }}>
         <div style={{ ...titleStyle, marginBottom: 4 }}>主动通知节流</div>
         {notifyStatus ? (
@@ -699,7 +740,9 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
           {calmError && <span role="alert" style={{ color: '#e5484d', fontSize: 12 }}>{calmError}</span>}
         </div>
       </div>
+      </Section>
 
+      <Section title="⚡ 系统行为">
       <div style={{ marginBottom: 12 }}>
         <div style={{ ...titleStyle, marginBottom: 4 }}>💤 防休眠</div>
         <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
@@ -715,7 +758,9 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
           启用防休眠（重启守护进程后生效）
         </label>
       </div>
+      </Section>
 
+      <Section title="🔐 多用户与安全">
       <div style={{ marginBottom: 12 }}>
         <div style={{ ...titleStyle, marginBottom: 4 }}>🔐 信任用户（多用户）</div>
         {!trust ? (
@@ -806,13 +851,14 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
             </div>
             {trustMessage && <div role="status" style={{ color: '#2f9e44', marginTop: 6, fontSize: 12 }}>{trustMessage}</div>}
             {trustError && <div role="alert" style={{ color: '#e5484d', marginTop: 6, fontSize: 12 }}>{trustError}</div>}
-            <div style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
-              信任用户与 owner 各自拥有独立会话、独立上下文，互不可见。撤销信任后其新消息将被拒绝，但已有历史保留。
-              修改信任模式后，新入站消息立即生效，无需重启。
-            </div>
+             <div style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
+               信任用户与 owner 各自拥有独立会话、独立上下文，互不可见。撤销信任后其新消息将被拒绝，但已有历史保留。
+               修改信任模式后，新入站消息立即生效，无需重启。
+             </div>
           </>
         )}
       </div>
+      </Section>
 
       {setupPhase === 'starting' && (
         <div role="status" style={{ marginBottom: 8 }}>正在生成二维码…</div>
@@ -851,22 +897,6 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
           </button>
         </div>
       )}
-
-      <pre style={outputStyle} aria-live="polite">{output}</pre>
-
-      <div style={buttonRowStyle}>
-        {actions.map((action) => (
-          <button
-            key={action.label}
-            type="button"
-            style={buttonStyle}
-            disabled={action.disabled ?? false}
-            onClick={action.run}
-          >
-            {action.label}
-          </button>
-        ))}
-      </div>
 
       <div style={hintStyle}>
         也可在 DSH 对话中直接使用 wechat_bridge_setup / wechat_bridge_status / wechat_bridge_start / wechat_bridge_stop / wechat_bridge_logs 等工具。
