@@ -199,6 +199,7 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
   const [projectMessage, setProjectMessage] = useState('')
   const [projectError, setProjectError] = useState('')
   const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null)
+  const [pendingStatus, setPendingStatus] = useState<{ count: number; chars: number; oldestQueuedAt: number | null } | null>(null)
   const [calm, setCalm] = useState<CalmUiState>(CALM_DEFAULTS)
   const [preventSleep, setPreventSleep] = useState(false)
   const [calmBusy, setCalmBusy] = useState(false)
@@ -239,6 +240,18 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+    }
+    // 待补发队列（发送失败暂存）单独拉取
+    try {
+      const pendingRes = await fetch(`${API_BASE}/pending/status`, { cache: 'no-store' })
+      if (pendingRes.ok) {
+        const pendingData = await pendingRes.json()
+        if (pendingData && typeof pendingData === 'object' && pendingData.ok) {
+          setPendingStatus(pendingData.data ?? null)
+        }
+      }
+    } catch {
+      // ignore
     }
     // 信任集单独拉取（失败不影响主状态展示）
     try {
@@ -597,6 +610,22 @@ export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.
           </div>
         ) : (
           <div style={{ fontSize: 12, opacity: 0.7 }}>守护进程未运行，暂无数据。</div>
+        )}
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ ...titleStyle, marginBottom: 4 }}>📮 待补发队列</div>
+        {pendingStatus && pendingStatus.count > 0 ? (
+          <div style={{ fontSize: 12 }}>
+            有 <strong style={{ color: '#b7791f' }}>{pendingStatus.count}</strong> 条消息发送失败待补发（共 {pendingStatus.chars} 字），daemon 会启动/定时自动重试。
+            {pendingStatus.oldestQueuedAt
+              ? ` 最早入队 ${new Date(pendingStatus.oldestQueuedAt).toLocaleString('zh-CN')}`
+              : ''}
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, opacity: 0.7 }}>
+            {pendingStatus ? '无待补发消息（发送失败会自动暂存并在 daemon 重启/定时时补发）。' : '守护进程未运行，暂无数据。'}
+          </div>
         )}
       </div>
 

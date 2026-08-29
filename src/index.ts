@@ -1314,6 +1314,16 @@ export function apply(ctx: Context, config: Config): void {
       },
     }))
 
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: '/@lanbaolu/dsh-wechat-bridge/pending/status',
+      handler: async (_req, res) => {
+        const result = await queryPendingStatus()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(result))
+      },
+    }))
+
     for (const action of ['start', 'stop', 'restart'] as const) {
       disposers.push(webServer.register({
         kind: 'exact',
@@ -1572,6 +1582,37 @@ export function apply(ctx: Context, config: Config): void {
       if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` }
       const data = (await resp.json()) as NotifyStatus
       return { ok: true, data }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  }
+
+  /**
+   * Query the daemon's pending (send-failure) queue status for the panel.
+   * 发送失败暂存队列（pending-queue）：数量/字数/最早入队时间。
+   */
+  async function queryPendingStatus(): Promise<{ ok: boolean; data?: { count: number; chars: number; oldestQueuedAt: number | null }; error?: string }> {
+    const portPath = join(dataDir, 'daemon-port.json')
+    let info: { port?: number; token?: string } | null = null
+    try {
+      info = JSON.parse(readFileSync(portPath, 'utf8')) as { port?: number; token?: string }
+    } catch {
+      return { ok: false, error: '守护进程未运行（缺少 daemon-port.json）' }
+    }
+    if (!info?.port || !info?.token) {
+      return { ok: false, error: '守护进程信息不完整' }
+    }
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 5000)
+      const resp = await fetch(`http://127.0.0.1:${info.port}/pending/status`, {
+        headers: { 'x-dsh-bridge-token': info.token },
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+      if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` }
+      const data = (await resp.json()) as { ok: boolean; count: number; chars: number; oldestQueuedAt: number | null }
+      return { ok: true, data: { count: data.count ?? 0, chars: data.chars ?? 0, oldestQueuedAt: data.oldestQueuedAt ?? null } }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }

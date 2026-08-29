@@ -532,6 +532,19 @@ async function runDaemon(): Promise<void> {
       res.end(JSON.stringify(notifyThrottle.getStatus()));
       return;
     }
+    // 待补发队列状态（pending-queue 接入后，供面板展示发送失败暂存量）。
+    if (req.method === 'GET' && (req.url === '/pending/status' || req.url === '/pending/status/')) {
+      const items = loadPendingQueue(account.accountId);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        accountId: account.accountId,
+        count: items.length,
+        chars: items.reduce((n, i) => n + i.text.length, 0),
+        oldestQueuedAt: items.length > 0 ? Math.min(...items.map((i) => i.queuedAt)) : null,
+      }));
+      return;
+    }
     const isNotify = req.url === '/notify' || req.url === '/notify/';
     const isApproval = req.url === '/approval' || req.url === '/approval/';
     if (req.method !== 'POST' || (!isNotify && !isApproval)) {
