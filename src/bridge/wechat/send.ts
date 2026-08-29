@@ -142,6 +142,20 @@ export function createSender(api: WeChatApi, botAccountId: string) {
             mid_size: media.fileSize,
           },
         };
+      } else if (media.mediaType === 'video') {
+        // 视频出站（协议级）：media_type=VIDEO，item 用 video_item{media, video_size}。
+        // 无缩略图（no_need_thumb，与 clawbot/Rust 实现一致）。
+        item = {
+          type: MessageItemType.VIDEO,
+          video_item: {
+            media: {
+              encrypt_query_param: media.encryptQueryParam,
+              aes_key: aesKeyBase64,
+              encrypt_type: 1,
+            },
+            video_size: media.fileSize,
+          },
+        };
       } else {
         item = {
           type: MessageItemType.FILE,

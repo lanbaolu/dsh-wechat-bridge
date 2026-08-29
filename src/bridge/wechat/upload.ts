@@ -10,9 +10,10 @@ import { logger } from '../logger.js';
 const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.ico']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi']);
 
 export interface UploadedMedia {
-  mediaType: 'image' | 'file';
+  mediaType: 'image' | 'file' | 'video';
   encryptQueryParam: string;
   aesKeyHex: string;
   fileName: string;
@@ -22,6 +23,10 @@ export interface UploadedMedia {
 
 export function isImageFile(filePath: string): boolean {
   return IMAGE_EXTENSIONS.has(extname(filePath).toLowerCase());
+}
+
+export function isVideoFile(filePath: string): boolean {
+  return VIDEO_EXTENSIONS.has(extname(filePath).toLowerCase());
 }
 
 export async function uploadFile(
@@ -36,7 +41,8 @@ export async function uploadFile(
 
   const fileName = basename(filePath);
   const isImage = isImageFile(filePath);
-  const mediaType = isImage ? UploadMediaType.IMAGE : UploadMediaType.FILE;
+  const isVideo = isVideoFile(filePath);
+  const mediaType = isImage ? UploadMediaType.IMAGE : isVideo ? UploadMediaType.VIDEO : UploadMediaType.FILE;
 
   // Prepare file
   const plaintext = readFileSync(filePath);
@@ -90,7 +96,7 @@ export async function uploadFile(
   logger.info('CDN upload succeeded', { fileName });
 
   return {
-    mediaType: isImage ? 'image' : 'file',
+    mediaType: isImage ? 'image' : isVideo ? 'video' : 'file',
     encryptQueryParam,
     aesKeyHex,
     fileName,

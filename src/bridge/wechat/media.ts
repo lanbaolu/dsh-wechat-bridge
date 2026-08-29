@@ -100,6 +100,53 @@ export function extractFirstFileItem(items?: MessageItem[]): MessageItem | undef
 }
 
 /**
+ * Find the first VIDEO type item in a list.
+ */
+export function extractFirstVideoItem(items?: MessageItem[]): MessageItem | undefined {
+  return items?.find((item) => item.type === MessageItemType.VIDEO);
+}
+
+/**
+ * Download a CDN video, decrypt it, and save to a temp directory as .mp4.
+ * Returns the local file path, or null on failure.
+ * 协议结构（iLink/ClawBot）：video_item.media.encrypt_query_param + aes_key（与文件同路径）。
+ */
+export async function downloadVideo(item: MessageItem): Promise<string | null> {
+  const videoItem = item.video_item;
+  if (!videoItem) return null;
+
+  let aesKey: string | undefined;
+  let encryptQueryParam: string | undefined;
+
+  if (videoItem.media?.encrypt_query_param) {
+    encryptQueryParam = videoItem.media.encrypt_query_param;
+    aesKey = videoItem.media.aes_key;
+  } else if (videoItem.cdn_media?.encrypt_query_param) {
+    encryptQueryParam = videoItem.cdn_media.encrypt_query_param;
+    aesKey = videoItem.cdn_media.aes_key;
+  }
+
+  if (!encryptQueryParam || !aesKey) {
+    logger.warn('Video item has no usable CDN data');
+    return null;
+  }
+
+  try {
+    const decrypted = await downloadAndDecrypt(encryptQueryParam, aesKey);
+    const tmpDir = path.join(os.tmpdir(), 'dsh-wechat-bridge');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const filePath = path.join(tmpDir, `video-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp4`);
+    fs.writeFileSync(filePath, decrypted);
+    logger.info('Video downloaded and saved', { path: filePath, size: decrypted.length });
+    return filePath;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn('Failed to download video', { error: msg });
+    return null;
+  }
+}
+
+/**
  * Download a CDN file, decrypt it, and save to a temp directory.
  * Returns the local file path, or null on failure.
  */

@@ -60,7 +60,14 @@ export interface FileItem {
 }
 
 export interface VideoItem {
-  cdn_media: CDNMedia;
+  cdn_media?: CDNMedia;
+  /** 新格式：媒体 CDN 引用（与 image/file 一致） */
+  media?: { encrypt_query_param: string; aes_key?: string; encrypt_type?: number };
+  video_size?: number;
+  play_length?: number;
+  video_md5?: string;
+  /** 缩略图 CDN 引用（可选） */
+  thumb_media?: { encrypt_query_param: string; aes_key?: string };
 }
 
 export interface MessageItem {

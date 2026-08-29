@@ -12,7 +12,7 @@ import { saveAccount, loadLatestAccount, type AccountData } from './wechat/accou
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
-import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, downloadFile } from './wechat/media.js';
+import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, extractFirstVideoItem, downloadFile, downloadVideo } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
 import { loadConfig, saveConfig, type CalmConfig } from './config.js';
@@ -878,6 +878,7 @@ async function handleMessage(
   const userText = extractTextFromItems(msg.item_list);
   const imageItem = extractFirstImageUrl(msg.item_list);
   const fileItem = extractFirstFileItem(msg.item_list);
+  const videoItem = extractFirstVideoItem(msg.item_list);
 
   // While the current turn is running, keep ordinary messages queued and
   // process them after this turn finishes, instead of dropping them.
@@ -951,7 +952,7 @@ async function handleMessage(
     }
 
     if (result.handled && result.dshPrompt) {
-      await sendToDsh(result.dshPrompt, imageItem, fileItem, fromUserId, contextToken,
+      await sendToDsh(result.dshPrompt, imageItem, fileItem, videoItem, fromUserId, contextToken,
         account, session, sessionStore, sender, config, client);
       return;
     }
@@ -959,12 +960,12 @@ async function handleMessage(
     if (result.handled) return;
   }
 
-  if (!userText && !imageItem && !fileItem) {
-    await sender.sendText(fromUserId, contextToken, '暂不支持此类型消息，请发送文字、语音、图片或文件');
+  if (!userText && !imageItem && !fileItem && !videoItem) {
+    await sender.sendText(fromUserId, contextToken, '暂不支持此类型消息，请发送文字、语音、图片、视频或文件');
     return;
   }
 
-  await sendToDsh(userText, imageItem, fileItem, fromUserId, contextToken,
+  await sendToDsh(userText, imageItem, fileItem, videoItem, fromUserId, contextToken,
     account, session, sessionStore, sender, config, client);
 }
 
@@ -972,6 +973,7 @@ async function sendToDsh(
   userText: string,
   imageItem: ReturnType<typeof extractFirstImageUrl>,
   fileItem: ReturnType<typeof extractFirstFileItem>,
+  videoItem: ReturnType<typeof extractFirstVideoItem>,
   fromUserId: string,
   contextToken: string,
   account: AccountData,
@@ -988,7 +990,7 @@ async function sendToDsh(
   session.state = 'processing';
   sessionStore.save(fromUserId, session);
 
-  sessionStore.addChatMessage(session, 'user', userText || '(图片/文件)');
+  sessionStore.addChatMessage(session, 'user', userText || '(图片/视频/文件)');
   const stopTyping = sender.startTyping(fromUserId, contextToken);
 
   try {
@@ -1014,6 +1016,18 @@ async function sendToDsh(
         prompt = userText
           ? `${userText}\n\n用户发送了文件: ${fileName}\n文件已保存到: ${filePath}\n请先读取这个文件再回答。`
           : `用户发送了文件: ${fileName}\n文件已保存到: ${filePath}\n请读取这个文件并总结其内容。`;
+      }
+    }
+
+    if (videoItem) {
+      const filePath = await downloadVideo(videoItem);
+      if (filePath) {
+        files.push(filePath);
+        prompt = userText
+          ? `${userText}\n\n用户发送了视频，已保存到: ${filePath}\n请查看这段视频。`
+          : `用户发送了视频，已保存到: ${filePath}\n请查看这段视频。`;
+      } else {
+        prompt = (userText ? `${userText}\n\n` : '') + '用户发送了视频，但下载失败，请基于已有信息回复。';
       }
     }
 
