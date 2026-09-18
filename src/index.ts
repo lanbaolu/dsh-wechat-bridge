@@ -247,9 +247,14 @@ export function apply(ctx: Context, config: Config): void {
   const selectedSessionIds = new Map<string, string>(Object.entries(loadSelectedSessionIds()))
 
   function newDshSessionId(key: string): string {
-    // 多用户 key 形如 ${botAccountId}::${userId}——DSH 会话 ID 会进文件路径，
-    // ':' 在 Windows 上是非法文件名字符，统一清洗为 '-'。
-    const safe = key.replace(/[^A-Za-z0-9_.@-]/g, '-')
+    // 多用户 key 形如 ${botAccountId}::${userId}，而账号/用户 id 本身自带 '@' 与 '.'。
+    // DSH 会话 id 有两处字符集要求：
+    //  - Windows 文件名：':' 之类非法；
+    //  - 存储层 per-record key（session_projcache 用会话 id 作 key）：必须匹配
+    //    /^[a-zA-Z0-9_-]+$/，否则该会话的投影缓存每次写入都被拒绝，日志持续刷
+    //    "per-record key ... is not path-safe"。
+    // 因此这里只保留 [A-Za-z0-9_-]，其余一律替换为 '-'。
+    const safe = key.replace(/[^A-Za-z0-9_-]/g, '-')
     return `wb-${safe}-${Date.now()}-${randomBytes(4).toString('hex')}`
   }
 
