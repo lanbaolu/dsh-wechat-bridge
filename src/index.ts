@@ -458,6 +458,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (handle) await handle.dispose()
     closeStreams(accountId)
+    turnStreamState.delete(accountId)
   }
 
   /** Register the DSH session under a dedicated workspace so it doesn't stay Ungrouped. */
@@ -753,6 +754,15 @@ export function apply(ctx: Context, config: Config): void {
 
     // 每账号最近一次 LLM 用量：inputTokens + cacheReadTokens ≈ 当前上下文大小。
     const lastUsage = new Map<string, StreamUsage>()
+    /**
+     * 本轮流式状态：宿主是否真的推送过 text-delta，以及最后一条 assistant 消息正文。
+     *
+     * 会话格式 v3 起 `assistant/chunk` 不再写入会话日志，而 `session/event` 只广播
+     * 被 append 的事件，所以该事件不会再到达这里（实测一轮里能收到
+     * turn/start、assistant/message、turn/end，但没有任何 assistant/chunk）。
+     * 若只依赖 chunk，守护进程收不到任何文本，只会回一句「DSH 无返回内容。」。
+     */
+    const turnStreamState = new Map<string, { hasChunk: boolean; lastText: string }>()
 
   // Subscribe to every session event and forward assistant chunks to the
   // bridge daemon. Only sessions created by this plugin are forwarded.
@@ -762,14 +772,37 @@ export function apply(ctx: Context, config: Config): void {
     const accountId = [...sessionIds.entries()].find(([, v]) => v === sid)?.[0]
     if (!accountId) return
 
+    const streamState = turnStreamState.get(accountId) ?? { hasChunk: false, lastText: '' }
+    turnStreamState.set(accountId, streamState)
+
     if (event.type === 'assistant/chunk') {
       const chunk = event.data.chunk as { type?: string; text?: string; usage?: StreamUsage } | undefined
       if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
+        streamState.hasChunk = true
         broadcast(accountId, { type: 'chunk', text: chunk.text })
-        } else if (chunk?.type === 'usage' && chunk.usage) {
-          lastUsage.set(accountId, chunk.usage)
-        }
-      } else if (event.type === 'turn/end') {
+      } else if (chunk?.type === 'usage' && chunk.usage) {
+        lastUsage.set(accountId, chunk.usage)
+      }
+    } else if (event.type === 'assistant/message') {
+      // 兜底素材：每步结束都会 append 这条，正文就是该步的完整输出。
+      const content = (event.data as { message?: { content?: unknown } }).message?.content
+      if (Array.isArray(content)) {
+        const text = content
+          .map((block) => block as { type?: string; text?: string })
+          .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+          .map((block) => block.text as string)
+          .join('')
+        if (text) streamState.lastText = text
+      }
+    } else if (event.type === 'turn/end') {
+      const fallbackText = streamState.hasChunk ? '' : streamState.lastText
+      turnStreamState.delete(accountId)
+      if (fallbackText) {
+        // 宿主没有推送流式增量：把整轮正文作为单个 chunk 补发，避免守护进程
+        // 判定为空回复。（批量推送由守护进程侧按阈值/定时器负责，不会刷屏。）
+        debugLog('session turn/end fallback', { accountId, chars: fallbackText.length })
+        broadcast(accountId, { type: 'chunk', text: fallbackText })
+      }
       debugLog('session turn/end', { accountId, sessionId: sid, reason: event.data.reason })
       broadcast(accountId, { type: 'done', turn: event.data.turn, message: 'turn ended', usage: lastUsage.get(accountId) })
       if (pendingProjectSwitches.has(accountId)) {
